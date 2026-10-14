@@ -203,6 +203,11 @@ void MainWindow::setPalWindow(PalWindow* palWindow)
 
         tuneMenu();
 
+        // Применяем стартовый Full-windowed mode. Именно здесь, а не в
+        // createActions(): m_statusBar создаётся позже createActions(), и строка
+        // состояния осталась бы видимой.
+        onFullwindow();
+
         if (m_fullscreenMode)
             setFullScreen(false);
 
@@ -1464,6 +1469,7 @@ void MainWindow::createActions()
     // Mute
     m_muteAction = new QAction(QIcon(m_darkTheme ? ":/icons/mute-dark.png" : ":/icons/mute.png"), tr("Mute"), this);
     m_muteAction->setCheckable(true);
+    m_muteAction->setChecked(true); // стартуем без звука, см. SoundMixer::m_muted
     m_muteAction->setToolTip(tr("Mute (Alt-M)"));
     QList<QKeySequence> muteKeysList;
     ADD_HOTKEY(muteKeysList, Qt::Key_M);
@@ -1763,6 +1769,7 @@ void MainWindow::createActions()
 
     m_fullwindowAction = new QAction(tr("Full-windowed mode"), this);
     m_fullwindowAction->setCheckable(true);
+    m_fullwindowAction->setChecked(true); // стартуем без меню и панелей, onFullwindow() зовётся из setPalWindow
     //setToolTip(tr("Hide menu and buttons (Alt-\\)"));
     QList<QKeySequence> fullwindowKeysList;
     ADD_HOTKEY(fullwindowKeysList, Qt::Key_Backslash);
