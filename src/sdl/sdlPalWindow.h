@@ -23,7 +23,13 @@
 #include <map>
 
 #include <SDL2/SDL.h>
+#ifdef __APPLE__
+// на маке заголовки GL лежат иначе, а типы расширений (PFNGL...) даёт SDL
+#define GL_GLEXT_LEGACY
+#include <SDL2/SDL_opengl.h>
+#else
 #include <GL/gl.h>
+#endif
 
 #include "../EmuTypes.h"
 #include "../PalKeys.h"

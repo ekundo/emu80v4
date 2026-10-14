@@ -6,6 +6,11 @@ INSTALLDIR= ~/emu80
 CC = c++
 CFLAGS = -c -Wall -std=c++11 `sdl2-config --cflags` -DPAL_SDL -DPAL_LITE
 LDFLAGS = `sdl2-config --libs` -lGL
+ifeq ($(shell uname),Darwin)
+# мак: заголовки из Homebrew, OpenGL — фреймворк
+CFLAGS += -I/opt/homebrew/include
+LDFLAGS = `sdl2-config --libs` -framework OpenGL
+endif
 
 SRC = $(SRCDIR)/*.cpp
 SRCSDL = $(SRCDIR)/sdl/*.cpp

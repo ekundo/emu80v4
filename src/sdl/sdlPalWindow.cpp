@@ -453,6 +453,16 @@ void PalWindow::screenshotRequest(const std::string& ssFileName)
 
 void PalWindow::createGlContext()
 {
+#ifdef __APPLE__
+    // На маке свой вывод через GL даёт чёрное окно: контекст создаётся, шейдеры
+    // и VBO принимаются, а на экране ничего. Пути отката для этого уже есть
+    // (ниже m_glAvailable сбрасывается при неудаче), поэтому просто идём по
+    // нему -- через SDL_Renderer, он на маке рисует как надо. Стенду без окна
+    // всё равно: кадр он берёт в drawImage, до выбора способа рисования.
+    m_glAvailable = false;
+    return;
+#endif
+
     if (m_glContext)
         SDL_GL_DeleteContext(m_glContext);
 
