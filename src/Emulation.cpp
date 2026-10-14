@@ -230,14 +230,20 @@ void Emulation::processCmdLine()
         emuSetPropertyValue(platformName + ".hdd", "fileName", hdd);
 
     // EDD
+    // У Вектора квазидиск в конфиге зовётся ramDisk, а не edd, поэтому --edd
+    // молча проходил мимо и загрузчик уходил на дисковод. Пробуем оба имени.
     string edd = m_cmdLine["edd"];
     if (!edd.empty())
-        emuSetPropertyValue(platformName + ".edd", "fileName", edd);
+        if (!emuSetPropertyValue(platformName + ".edd", "fileName", edd) &&
+            !emuSetPropertyValue(platformName + ".ramDisk", "fileName", edd))
+            palMsgBox("Нет квазидиска, куда подключить " + edd, true);
 
     // EDD2
     string edd2 = m_cmdLine["edd2"];
     if (!edd2.empty())
-        emuSetPropertyValue(platformName + ".edd2", "fileName", edd2);
+        if (!emuSetPropertyValue(platformName + ".edd2", "fileName", edd2) &&
+            !emuSetPropertyValue(platformName + ".ramDisk2", "fileName", edd2))
+            palMsgBox("Нет второго квазидиска, куда подключить " + edd2, true);
 }
 
 
