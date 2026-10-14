@@ -2149,10 +2149,47 @@ void MainWindow::onFpsTimer()
 }
 
 
+#ifdef Q_OS_MAC
+// Виртуальный keycode macOS -> Qt::Key американской раскладки.
+// translateKey разбирает логическую evt->key(), а она зависит от раскладки хоста:
+// при русской буквы приходят кириллическими Qt::Key (0x410..0x44F), в switch их
+// нет, и эмулятор на клавиши не реагирует. Keycode привязан к позиции клавиши,
+// поэтому от раскладки не зависит (SDL-сборка так и работает - по скан-коду).
+// Покрыт только буквенно-цифровой блок ANSI; нумпад (keycode 0x41+), Return,
+// Tab и Space не трогаем, иначе сломаются ветки keypad ? PK_KP_* : ...
+static int qtKeyFromMacVirtualKey(quint32 vk)
+{
+    static const char keys[0x33] = {
+        'A', 'S', 'D', 'F', 'H', 'G', 'Z',  'X',  'C', 'V', 0,    'B',
+        'Q', 'W', 'E', 'R', 'Y', 'T', '1',  '2',  '3', '4', '6',  '5',
+        '=', '9', '7', '-', '8', '0', ']',  'O',  'U', '[', 'I',  'P',
+        0,   'L', 'J', '\'', 'K', ';', '\\', ',', '/', 'N', 'M',  '.',
+        0,   0,   '`'
+    };
+
+    return vk < sizeof(keys) ? keys[vk] : 0;
+}
+#endif
+
+
 PalKeyCode MainWindow::translateKey(QKeyEvent* evt)
 {
     int key = evt->key();
     bool keypad = evt->modifiers() & Qt::KeypadModifier;
+
+#ifdef Q_OS_MAC
+    if (key < Qt::Key_Escape) { // спецклавиши (>= 0x01000000) от раскладки не зависят
+        quint32 vk = evt->nativeVirtualKey();
+        // Страховка на случай, если nativeVirtualKey не заполнен: keycode 0 (это
+        // клавиша A) подменяем только на не-ASCII клавише, тогда латинская
+        // раскладка в худшем случае останется работать как была.
+        if (vk != 0 || key >= 0x80) {
+            int latinKey = qtKeyFromMacVirtualKey(vk);
+            if (latinKey)
+                key = latinKey;
+        }
+    }
+#endif
 
     switch (key) {
     case Qt::Key_A:
@@ -2299,7 +2336,21 @@ PalKeyCode MainWindow::translateKey(QKeyEvent* evt)
         return keypad ? PK_KP_DIV : PK_SLASH;
 
     case Qt::Key_CapsLock:
+#ifdef Q_OS_MAC
+        // РУС/ЛАТ. Штатные клавиши (правый Ctrl / Insert / Num 0) на маке
+        // недостижимы: правые модификаторы Qt не различает, а HID-usage Insert
+        // macOS отдаёт как kVK_Help -> Qt::Key_Help, который Emu80 игнорирует.
+        // Caps Lock иначе простаивает (PK_CAPSLOCK нигде не используется) и в Qt
+        // приходит фиксирующимся - KeyPress при включении, KeyRelease при
+        // выключении, - то есть ведёт себя как настоящая защёлкивающаяся РУС/ЛАТ
+        // на Векторе, а лампочка на клавише работает индикатором.
+        // Важно: в macOS должна быть снята галка "Use Caps Lock key to switch to
+        // and from <язык>", иначе короткое нажатие уходит на смену раскладки и
+        // флага капса не выставляет.
+        return PK_INS;
+#else
         return PK_CAPSLOCK;
+#endif
 
     case Qt::Key_F1:
         return PK_F1;
