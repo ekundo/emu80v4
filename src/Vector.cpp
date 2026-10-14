@@ -1143,6 +1143,22 @@ bool VectorKbdLayout::processSpecialKeys(PalKeyCode keyCode, bool pressed)
 }
 
 
+// РУС/ЛАТ ещё и на правый Alt с правым Cmd. Штатно она посажена только на правый
+// Ctrl, Insert и ноль нумпада (KbdLayout.cpp, translateCommonKeys) -- на
+// клавиатурах Apple нет ни одной из трёх, и переключить алфавит нечем.
+// «Умная» раскладка тут не выручает: для семейства РК юникодный переводчик
+// гасит признак языка (lang = false в RkKbdLayout::translateUnicodeKey) и
+// посылает русскую букву как латинскую клавишу с СС. У штатной МикроДОС СС и
+// выбирает алфавит, а у той, что стоит на T-72, переключение регистров
+// переделано: СС -- это регистр, алфавит переключает только РУС/ЛАТ.
+EmuKey VectorKbdLayout::translateKey(PalKeyCode keyCode)
+{
+    if (keyCode == PK_RALT || keyCode == PK_RWIN)
+        return EK_LANG;
+    return RkKbdLayout::translateKey(keyCode);
+}
+
+
 bool VectorRamDiskSelector::setProperty(const string& propertyName, const EmuValuesList& values)
 {
     if (AddressableDevice::setProperty(propertyName, values))
