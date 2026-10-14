@@ -133,7 +133,9 @@ class SoundMixer : public ActiveDevice
         int m_error = 0;
 
         // признак беззвучного режима
-        bool m_muted = false;
+        // Стартуем замьюченными; кнопка мьюта в тулбаре стартует нажатой
+        // (m_muteAction->setChecked в qtMainWindow.cpp), звук включается ей же.
+        bool m_muted = true;
 
         // Уровень громкости (1-5)
         int m_volume = 5;
