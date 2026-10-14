@@ -394,6 +394,7 @@ class VectorKbdLayout : public RkKbdLayout
 
     protected:
         bool processSpecialKeys(PalKeyCode keyCode, bool pressed) override;
+        EmuKey translateKey(PalKeyCode keyCode) override;
 };
 
 
