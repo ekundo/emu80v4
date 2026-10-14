@@ -20,6 +20,7 @@
 #include <cstring>
 
 #include "sdlPalWindow.h"
+#include "../EmuAuto.h"
 #include "sdlGlExt.h"
 
 #include "sdlPal.h"
@@ -266,6 +267,12 @@ void PalWindow::drawFillGl(uint32_t color)
 
 void PalWindow::drawImage(uint32_t* pixels, int imageWidth, int imageHeight, double aspectRatio, bool blend, bool useAlpha)
 {
+    // Стенд: счёт кадров, снимки и ввод по сценарию -- см. sdl/emuAuto.cpp.
+    // Взято здесь, потому что сюда приходит уже готовая картинка, независимо от
+    // того, рисуется она через OpenGL или нет.
+    if (!blend && !useAlpha)
+        autoOnFrame(this, pixels, imageWidth, imageHeight);
+
     if (m_glAvailable) {
         drawImageGl(pixels, imageWidth, imageHeight, aspectRatio, blend, useAlpha);
         return;
