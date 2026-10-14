@@ -14,6 +14,11 @@ CXXFLAGS ?= -O2 -Wall
 # Mandatory flags are kept separately, so overriding CXXFLAGS doesn't drop them
 EMU_CXXFLAGS := -std=c++11 $(shell sdl2-config --cflags) -DPAL_SDL -DPAL_LITE -I$(SRC_DIR)/3rdparty
 LDLIBS := $(shell sdl2-config --libs) -lGL
+ifeq ($(shell uname),Darwin)
+# мак: код подключает <SDL2/SDL.h>, а sdl2-config даёт путь до .../include/SDL2; OpenGL — фреймворк
+EMU_CXXFLAGS += -I$(shell sdl2-config --prefix)/include
+LDLIBS := $(shell sdl2-config --libs) -framework OpenGL
+endif
 
 SOURCES := $(wildcard $(SRC_DIR)/*.cpp $(SRC_DIR)/sdl/*.cpp $(SRC_DIR)/lite/*.cpp $(SRC_DIR)/3rdparty/z80/*.cpp)
 OBJECTS := $(patsubst $(SRC_DIR)/%.cpp,$(OBJ_DIR)/%.o,$(SOURCES))
