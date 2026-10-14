@@ -22,6 +22,7 @@
 #include "Globals.h"
 #include "Cpu.h"
 #include "Cpu8080.h"
+#include "EmuAuto.h"
 #include "CpuHook.h"
 #include "CpuWaits.h"
 #include "PlatformCore.h"
@@ -1730,6 +1731,9 @@ Cpu8080::Cpu8080() {
 
 
 void Cpu8080::operate() {
+    autoTrace(PC, AF, BC, DE, HL, SP);  // стенд: карта адресов + трасса регистров, см. sdl/emuAuto.cpp
+    autoSp(SP, PC);     // стенд: как глубоко уходил стек
+
     if (!m_hooksDisabled) {
         bool retFlag = false;
         list<CpuHook*>* hookList = m_hookArray[PC];

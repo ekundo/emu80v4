@@ -26,6 +26,7 @@
 #include "CpuWaits.h"
 #include "Emulation.h"
 #include "PlatformCore.h"
+#include "EmuAuto.h"
 
 using namespace std;
 
