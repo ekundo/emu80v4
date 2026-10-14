@@ -34,8 +34,22 @@
 #include "Covox.h"
 #include "PrnWriter.h"
 #include "AtaDrive.h"
+#include "EmuAuto.h"
 
 using namespace std;
+
+// Стенд: слепок памяти ТАК, КАК ЕЁ ВИДИТ ПРОЦЕССОР -- с учётом того, что
+// МикроДОС держит страницу квазидиска подключённой над экранным ОЗУ.
+static VectorAddrSpace* g_autoAs = nullptr;
+int autoPeekMain(uint16_t addr)
+{
+    return g_autoAs ? g_autoAs->peekForStand(addr) : -1;
+}
+
+int autoPeekBank(uint16_t addr, int bank)
+{
+    return g_autoAs ? g_autoAs->peekBank(addr, bank) : -1;
+}
 
 
 void VectorAddrSpace::reset() {
@@ -71,19 +85,47 @@ void VectorAddrSpace::writeByte(int addr, uint8_t value)
     }
 
     // Barkar
-    if (m_stackDiskEnabled && m_cpu->checkForStackOperation())
+    if (m_stackDiskEnabled && m_cpu->checkForStackOperation()) {
+        autoWrite2(addr & 0xFFFF, value, 3);
         m_ramDisk->writeByte(m_stackDiskPage * 0x10000 + addr, value);
-    else if (m_stackDiskEnabled2 && m_cpu->checkForStackOperation())
+    } else if (m_stackDiskEnabled2 && m_cpu->checkForStackOperation()) {
+        autoWrite2(addr & 0xFFFF, value, 4);
         m_ramDisk2->writeByte(m_stackDiskPage2 * 0x10000 + addr, value);
-    else if (m_inRamPagesMask && (addr >= 0x8000) && m_inRamPagesMask & (1 << ((addr & 0x6000) >> 13)))
+    } else if (m_inRamPagesMask && (addr >= 0x8000) && m_inRamPagesMask & (1 << ((addr & 0x6000) >> 13))) {
+        autoWrite2(addr & 0xFFFF, value, 1);
         m_ramDisk->writeByte(m_inRamDiskPage * 0x10000 + addr, value);
-    else if (m_inRamPagesMask2 && (addr >= 0x8000) && m_inRamPagesMask2 & (1 << ((addr & 0x6000) >> 13)))
+    } else if (m_inRamPagesMask2 && (addr >= 0x8000) && m_inRamPagesMask2 & (1 << ((addr & 0x6000) >> 13))) {
+        autoWrite2(addr & 0xFFFF, value, 2);
         m_ramDisk2->writeByte(m_inRamDiskPage2 * 0x10000 + addr, value);
-    else {
+    } else {
         if (addr >= 0x8000 && m_crtRenderer)
             m_crtRenderer->vidMemWriteNotify();
+        g_autoAs = this;
+        autoWrite2(addr & 0xFFFF, value, 0);   // стенд: запись именно в основное ОЗУ
         m_mainMemory->writeByte(addr, value);
     }
+}
+
+
+uint8_t VectorAddrSpace::peekForStand(int addr)
+{
+    // как readByte, но без ПЗУ и без учёта стековых операций
+    if (m_inRamPagesMask && (addr >= 0x8000) && m_inRamPagesMask & (1 << ((addr & 0x6000) >> 13)))
+        return m_ramDisk->readByte(m_inRamDiskPage * 0x10000 + addr);
+    if (m_inRamPagesMask2 && (addr >= 0x8000) && m_inRamPagesMask2 & (1 << ((addr & 0x6000) >> 13)))
+        return m_ramDisk2->readByte(m_inRamDiskPage2 * 0x10000 + addr);
+    return m_mainMemory->readByte(addr);
+}
+
+
+// Слепок конкретного банка КД для окна A000-DFFF (независимо от текущего порта 10h).
+// bank 0..3 -> m_ramDisk[bank*0x10000 + addr]; вне окна и без КД -- основное ОЗУ.
+uint8_t VectorAddrSpace::peekBank(int addr, int bank)
+{
+    // bank 0..3 -- банк КД; bank>=4 -- основное ОЗУ (окно выкл, порт 10h=0)
+    if (bank < 4 && m_ramDisk && addr >= 0x8000)
+        return m_ramDisk->readByte(bank * 0x10000 + addr);
+    return m_mainMemory->readByte(addr);
 }
 
 

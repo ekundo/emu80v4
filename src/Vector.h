@@ -177,6 +177,8 @@ class VectorAddrSpace : public AddressableDevice
         void attachRam(AddressableDevice* mem) {m_mainMemory = mem;}
         void attachRom(Rom* rom) {m_rom = rom;}
         void attachRamDisk(int diskNum, AddressableDevice* ramDisk);
+        uint8_t peekForStand(int addr);   // стенд: слепок памяти глазами процессора
+        uint8_t peekBank(int addr, int bank);   // стенд: A000-DFFF из конкретного банка КД
         void attachCrtRenderer(VectorRenderer* crtRenderer) {m_crtRenderer = crtRenderer;};
         void enableRom() {m_romEnabled = true;}
         void disableRom() {m_romEnabled = false;}
