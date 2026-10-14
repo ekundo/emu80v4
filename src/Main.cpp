@@ -129,7 +129,16 @@ int main (int argc, char** argv)
     palStart();
 
 #ifdef MCP_SERVER
-    g_McpServer.Start(MCP_SERVER_PORT);
+    {
+        // второй экземпляр (проверочная сборка) рядом с рабочим: свой порт через EMU80_MCP_PORT
+        unsigned short port = MCP_SERVER_PORT;
+        if (const char* env = getenv("EMU80_MCP_PORT")) {
+            int p = atoi(env);
+            if (p > 0 && p < 65536)
+                port = static_cast<unsigned short>(p);
+        }
+        g_McpServer.Start(port);
+    }
 #endif
 
     palExecute();
