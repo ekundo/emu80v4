@@ -1,0 +1,162 @@
+# Release-style builds of Emu80qt (plain and with the MCP server) for Windows, Linux and macOS.
+# Archive names and layouts follow the upstream releases (github.com/vpyk/emu80v4/releases):
+#   Emu80qt_<ver>_qt6.zip              Windows x64, Qt 6, MinGW; Qt plugins in _qtplugins (qt.conf)
+#   Emu80qt_<ver>_linux_x86-64.tar.gz  Linux x86-64; Qt libraries in lib/, plugins in _qtplugins
+#   Emu80qt_<ver>_macos_universal.zip  macOS arm64 + x86_64 app bundles (upstream ships amd64 only)
+name: Build
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+
+env:
+  QT_VERSION: '6.8.3'
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      ver: ${{ steps.v.outputs.ver }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: v
+        run: |
+          get() { awk -v k="$1" '$1=="#define" && $2==k {print $3}' src/Version.h; }
+          echo "ver=$(get VER_MAJOR)$(get VER_MINOR)$(get VER_BUILD)" >> "$GITHUB_OUTPUT"
+
+  windows:
+    needs: version
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    env:
+      APP: Emu80qt_${{ needs.version.outputs.ver }}_qt6
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jurplel/install-qt-action@v4
+        with:
+          version: ${{ env.QT_VERSION }}
+          arch: win64_mingw
+          modules: qtmultimedia
+          tools: tools_mingw1310,qt.tools.win64_mingw1310
+          cache: true
+      - name: Add MinGW to PATH
+        run: echo "$IQTA_TOOLS/mingw1310_64/bin" >> "$GITHUB_PATH"
+      - name: Build
+        run: |
+          for v in 0 1; do
+            mkdir -p "build$v" && cd "build$v"
+            qmake ../src/Emu80qt.pro CONFIG+=release CONFIG-=debug_and_release MCP_SERVER=$v
+            mingw32-make -j4
+            cd ..
+          done
+      - name: Package
+        run: |
+          mkdir "$APP"
+          cp build0/Emu80qt.exe build1/Emu80qt-mcp.exe "$APP/"
+          for exe in Emu80qt.exe Emu80qt-mcp.exe; do
+            windeployqt --release --no-translations --no-system-d3d-compiler \
+              --plugindir "$APP/_qtplugins" "$APP/$exe"
+          done
+          printf '[Paths]\r\nPlugins=_qtplugins\r\n' > "$APP/qt.conf"
+          cp -r dist/* "$APP/"
+          cp win32stuff/*.cmd doc/*.md doc/*.pdf COPYING.txt whatsnew.txt README.md "$APP/"
+          7z a -tzip "$APP.zip" "$APP" > /dev/null
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.APP }}
+          path: ${{ env.APP }}.zip
+
+  linux:
+    needs: version
+    runs-on: ubuntu-22.04
+    env:
+      APP: Emu80qt_${{ needs.version.outputs.ver }}_linux_x86-64
+    steps:
+      - uses: actions/checkout@v4
+      - name: System packages
+        run: sudo apt-get update && sudo apt-get install -y libgl1-mesa-dev libegl1-mesa-dev libxkbcommon-dev libpulse-dev patchelf
+      - uses: jurplel/install-qt-action@v4
+        with:
+          version: ${{ env.QT_VERSION }}
+          arch: linux_gcc_64
+          modules: qtmultimedia
+          cache: true
+      - name: Build
+        run: |
+          for v in 0 1; do
+            mkdir -p "build$v" && cd "build$v"
+            qmake ../src/Emu80qt.pro CONFIG+=release MCP_SERVER=$v
+            make -j4
+            cd ..
+          done
+      - name: Package
+        run: |
+          mkdir -p "$APP/lib" "$APP/_qtplugins"
+          cp build0/Emu80qt build1/Emu80qt-mcp "$APP/"
+          patchelf --set-rpath '$ORIGIN/lib' "$APP/Emu80qt" "$APP/Emu80qt-mcp"
+          for d in platforms xcbglintegrations platforminputcontexts multimedia; do
+            if [ -d "$QT_ROOT_DIR/plugins/$d" ]; then cp -r "$QT_ROOT_DIR/plugins/$d" "$APP/_qtplugins/"; fi
+          done
+          # Qt libraries the binaries and plugins need, transitively (Qt's own .so carry RUNPATH $ORIGIN)
+          while :; do
+            n=$(ls "$APP/lib" | wc -l)
+            find "$APP" -type f \( -name 'Emu80qt*' -o -name '*.so*' \) -print0 |
+              xargs -0 env LD_LIBRARY_PATH="$QT_ROOT_DIR/lib" ldd 2>/dev/null |
+              awk -v q="$QT_ROOT_DIR/lib/" 'index($3, q) == 1 {print $3}' | sort -u |
+              while read -r f; do cp -nL "$f" "$APP/lib/"; done
+            [ "$(ls "$APP/lib" | wc -l)" = "$n" ] && break
+          done
+          ls "$APP/lib"
+          printf '[Paths]\nPlugins=_qtplugins\n' > "$APP/qt.conf"
+          cp -r dist/* "$APP/"
+          cp doc/*.md doc/*.pdf COPYING.txt whatsnew.txt README.md "$APP/"
+          tar czf "$APP.tar.gz" "$APP"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.APP }}
+          path: ${{ env.APP }}.tar.gz
+
+  macos:
+    needs: version
+    runs-on: macos-14
+    env:
+      APP: Emu80qt_${{ needs.version.outputs.ver }}_macos
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jurplel/install-qt-action@v4
+        with:
+          version: ${{ env.QT_VERSION }}
+          arch: clang_64
+          modules: qtmultimedia
+          cache: true
+      - name: Build
+        run: |
+          for v in 0 1; do
+            mkdir -p "build$v" && cd "build$v"
+            qmake ../src/Emu80qt.pro CONFIG+=release MCP_SERVER=$v QMAKE_APPLE_DEVICE_ARCHS="x86_64 arm64"
+            make -j4
+            cd ..
+          done
+      - name: Package
+        run: |
+          mkdir "$APP"
+          for b in build0/Emu80qt.app build1/Emu80qt-mcp.app; do
+            name=$(basename "$b" .app)
+            cp -R dist/ "$b/Contents/MacOS/"
+            macdeployqt "$b" || true
+            # ad-hoc signatures piece by piece: platform data in Contents/MacOS keeps the bundle itself from sealing
+            find "$b/Contents/Frameworks" "$b/Contents/PlugIns" -name '*.dylib' -exec codesign -f -s - {} \;
+            for f in "$b"/Contents/Frameworks/*.framework; do codesign -f -s - "$f"; done
+            codesign -f -s - "$b/Contents/MacOS/$name"
+            lipo -info "$b/Contents/MacOS/$name"
+            cp -R "$b" "$APP/"
+          done
+          cp doc/*.md doc/*.pdf COPYING.txt whatsnew.txt README.md "$APP/"
+          ditto -c -k --keepParent "$APP" "${APP}_universal.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.APP }}_universal
+          path: ${{ env.APP }}_universal.zip
