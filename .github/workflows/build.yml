@@ -146,13 +146,14 @@ jobs:
           mkdir "$APP"
           for b in build0/Emu80qt.app build1/Emu80qt-mcp.app; do
             name=$(basename "$b" .app)
-            cp -R dist/ "$b/Contents/MacOS/"
-            macdeployqt "$b" || true
-            # ad-hoc signatures piece by piece: platform data in Contents/MacOS keeps the bundle itself from sealing
+            macdeployqt "$b"
+            # ad-hoc signatures piece by piece, before the platform data goes into Contents/MacOS: codesign takes
+            # those files for unsigned code of the bundle; the data keeps the bundle itself from sealing
             find "$b/Contents/Frameworks" "$b/Contents/PlugIns" -name '*.dylib' -exec codesign -f -s - {} \;
             for f in "$b"/Contents/Frameworks/*.framework; do codesign -f -s - "$f"; done
             codesign -f -s - "$b/Contents/MacOS/$name"
             lipo -info "$b/Contents/MacOS/$name"
+            cp -R dist/ "$b/Contents/MacOS/"
             cp -R "$b" "$APP/"
           done
           cp doc/*.md doc/*.pdf COPYING.txt whatsnew.txt README.md "$APP/"
