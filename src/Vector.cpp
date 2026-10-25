@@ -1010,7 +1010,7 @@ uint8_t VectorMouse::readReg()
     case 2:
         return uint8_t(y);
     case 3:
-        return m_wheel;
+        return takeDelta(m_wheel, 1, -128, 127);   // шаги колеса с прошлого чтения, как смещения 4, 5
     case 4:
         return takeDelta(m_acc[0], 2, -128, 127);
     case 5:
@@ -1056,7 +1056,8 @@ void VectorMouse::onMove(int dx, int dy)
 
 void VectorMouse::onWheel(int steps)
 {
-    m_wheel = uint8_t(m_wheel + steps);
+    // программа, что не читает колесо, копила бы без предела: больше байта копить незачем
+    m_wheel = std::max(-128, std::min(m_wheel + steps, 127));
 }
 
 
