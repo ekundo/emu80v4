@@ -443,6 +443,7 @@ void VectorRenderer::setPaletteColor(uint8_t color)
 {
     advanceTo(g_emulation->getCurClock() + m_ticksPerPixel * 27);
 
+    m_rawPalette[m_lastColor & 15] = color;
     m_colorPalette[m_lastColor] = ((color & 0x7) << 21) | ((color & 0x7) << 18) | ((color & 0x6) << 15) |
                                   ((color & 0x38) << 10) | ((color & 0x38) << 7) | ((color & 0x30) << 4) |
                                   (color & 0xC0) | ((color & 0xC0) >> 2) | ((color & 0xC0) >> 4) | ((color & 0xC0) >> 6);
@@ -1223,6 +1224,7 @@ bool VectorRamDiskSelector::setProperty(const string& propertyName, const EmuVal
 
 void VectorRamDiskSelector::writeByte(int, uint8_t value)
 {
+    m_lastValue = value;
     if (m_vectorAddrSpace)
         m_vectorAddrSpace->ramDiskControl(m_diskNum, ((value & 0x40) >> 6) | ((value & 0x20) >> 4) | ((value & 0x20) >> 3) | ((value & 0x80) >> 4), value & 0x10, value & 0x3, (value >> 2) & 0x3);
 }
@@ -1373,4 +1375,107 @@ uint8_t VectorHddRegisters::readByte(int addr)
     if (addr == 0)
         m_highR = read >> 8;
     return read & 0x00FF;
+}
+
+
+// ---------------------------------------------------------------- модем ComboLite
+
+#ifdef VECTOR_MODEM
+extern "C" {
+    int  sim_in(int port);
+    void sim_out(int port, int val);
+    void sim_esp(unsigned now_ms);
+    void sim_init(void);
+    extern int     (*sim_palette)(uint8_t pal[17]);
+    extern uint8_t (*sim_kvaz)(void);
+}
+
+// Код ESP один на процесс: откуда брать палитру и регистр 10h для DIAG.
+static VectorRenderer* s_modemRenderer = nullptr;
+static VectorRamDiskSelector* s_modemRamDisk = nullptr;
+
+static int modemPalette(uint8_t pal[17])
+{
+    for (int i = 0; i < 16; i++)
+        pal[i] = s_modemRenderer ? s_modemRenderer->rawPalette()[i] : 0;
+    pal[16] = 0;
+    return 0;
+}
+
+static uint8_t modemKvaz()
+{
+    return s_modemRamDisk ? s_modemRamDisk->lastValue() : 0;
+}
+#endif
+
+
+VectorModem::VectorModem()
+{
+#ifdef VECTOR_MODEM
+    sim_palette = modemPalette;
+    sim_kvaz = modemKvaz;
+    sim_init();
+#endif
+}
+
+
+bool VectorModem::setProperty(const std::string& propertyName, const EmuValuesList& values)
+{
+    if (AddressableDevice::setProperty(propertyName, values))
+        return true;
+
+    if (propertyName == "crtRenderer") {
+        m_renderer = static_cast<VectorRenderer*>(g_emulation->findObject(values[0].asString()));
+#ifdef VECTOR_MODEM
+        s_modemRenderer = m_renderer;
+#endif
+        return true;
+    } else if (propertyName == "ramDiskSelector") {
+        m_ramDiskSelector = static_cast<VectorRamDiskSelector*>(g_emulation->findObject(values[0].asString()));
+#ifdef VECTOR_MODEM
+        s_modemRamDisk = m_ramDiskSelector;
+#endif
+        return true;
+    }
+    return false;
+}
+
+
+// Опрос ESP: время ESP -- миллисекунды времени «Вектора».
+void VectorModem::poll()
+{
+#ifdef VECTOR_MODEM
+    uint64_t ticksPerMs = g_emulation->getFrequency() / 1000;
+    sim_esp(unsigned(g_emulation->getCurClock() / (ticksPerMs ? ticksPerMs : 1)));
+#endif
+}
+
+
+// Как на плате: ESP смотрит в канал раз в полмиллисекунды.
+void VectorModem::operate()
+{
+    poll();
+    m_curClock += g_emulation->getFrequency() / 2000;
+}
+
+
+uint8_t VectorModem::readByte(int addr)
+{
+#ifdef VECTOR_MODEM
+    return uint8_t(sim_in(0x28 + addr));
+#else
+    (void)addr;
+    return 0xFF;
+#endif
+}
+
+
+void VectorModem::writeByte(int addr, uint8_t value)
+{
+#ifdef VECTOR_MODEM
+    sim_out(0x28 + addr, value);
+#else
+    (void)addr;
+    (void)value;
+#endif
 }

@@ -236,6 +236,7 @@ ObjectFactory::ObjectFactory()
     REG_EMU_CLASS(VectorPpi8255Circuit2);
     REG_EMU_CLASS(VectorColorRegister);
     REG_EMU_CLASS(VectorMouse);
+    REG_EMU_CLASS(VectorModem);
     REG_EMU_CLASS(VectorKeyboard);
     REG_EMU_CLASS(VectorCpuWaits);
     REG_EMU_CLASS(VectorZ80CpuWaits);
