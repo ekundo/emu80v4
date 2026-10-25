@@ -10,7 +10,7 @@ set -e
 FW=${1:?путь к fw/ репозитория ComboLite}
 HERE=$(cd "$(dirname "$0")" && pwd)
 for f in vchan.c vchan.h modem.c modem.h bbslist.c bbslist.h \
-         inflate.c inflate.h vchan_sim.c board.h combo.h; do
+         inflate.c inflate.h fetch.h fetch_curl.c vchan_sim.c board.h combo.h; do
     cp "$FW/$f" "$HERE/$f"
 done
 git -C "$FW" log -1 --format='%H' > "$HERE/FW_VERSION" 2>/dev/null || true
