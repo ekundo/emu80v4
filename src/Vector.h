@@ -52,6 +52,9 @@ class VectorRenderer : public CrtRenderer, public IActive
 
         // derived from CrtRenderer
         void toggleCropping() override;
+
+        // палитра, как её писала программа: 16 байт порта 0Ch
+        const uint8_t* rawPalette() {return m_rawPalette;}
         void toggleColorMode() override;
         void prepareDebugScreen() override;
 
@@ -129,6 +132,8 @@ class VectorRenderer : public CrtRenderer, public IActive
 
         uint64_t m_curFrameClock;
         int m_curFramePixel;
+
+        uint8_t m_rawPalette[16] = {};  // байты, записанные в порт 0Ch (их спрашивает модем ComboLite)
 
         void setColorMode(bool colorMode);
         void prepareFrame();
@@ -410,11 +415,43 @@ class VectorRamDiskSelector : public AddressableDevice
         void writeByte(int, uint8_t value) override;
         uint8_t readByte(int)  override {return 0xff;}
 
+        uint8_t lastValue() {return m_lastValue;}    // порт только на запись: что записали последним
+
         static EmuObject* create(const EmuValuesList&) {return new VectorRamDiskSelector();}
 
     private:
         VectorAddrSpace* m_vectorAddrSpace = nullptr;
         int m_diskNum = 0;
+        uint8_t m_lastValue = 0;
+};
+
+
+// Wi-Fi модем платы ComboLite: UART 16550 на портах 28h-2Dh (doc/MODEM.md в репозитории платы,
+// https://github.com/ekundo/v06c-combolite), за ним -- AT-команды, telnet и сырой TCP. Код ESP платы
+// -- тот же, копией в src/combolite/ (sync.sh); сеть -- настоящая, сокетами хоста: ATDT хост:порт
+// идёт в интернет. Вместо ПЛИС и SPI -- модель канала из vchan_sim.c. ESP опрашивается раз в
+// миллисекунду времени «Вектора» и при обращении к порту. Регистр квазидиска (порт 10h) и палитру
+// модем отдаёт по запросу DIAG: TERM.COM, IRC.COM и GOPHER.COM возвращают их ОС на выходе.
+// На Windows модема нет (код ESP -- на сокетах POSIX): порты читаются как FFh.
+class VectorModem : public AddressableDevice, public IActive
+{
+    public:
+        VectorModem();
+
+        bool setProperty(const std::string& propertyName, const EmuValuesList& values) override;
+
+        void writeByte(int addr, uint8_t value) override;
+        uint8_t readByte(int addr) override;
+
+        void operate() override;
+
+        static EmuObject* create(const EmuValuesList&) {return new VectorModem();}
+
+    private:
+        VectorRenderer* m_renderer = nullptr;
+        VectorRamDiskSelector* m_ramDiskSelector = nullptr;
+
+        void poll();
 };
 
 

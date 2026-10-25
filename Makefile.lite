@@ -22,6 +22,11 @@ endif
 
 SOURCES := $(wildcard $(SRC_DIR)/*.cpp $(SRC_DIR)/sdl/*.cpp $(SRC_DIR)/lite/*.cpp $(SRC_DIR)/3rdparty/z80/*.cpp)
 OBJECTS := $(patsubst $(SRC_DIR)/%.cpp,$(OBJ_DIR)/%.o,$(SOURCES))
+
+# Wi-Fi модем платы ComboLite (VectorModem): код ESP платы на C, копией в src/combolite/
+EMU_CXXFLAGS += -DVECTOR_MODEM
+CSOURCES := $(wildcard $(SRC_DIR)/combolite/*.c)
+OBJECTS += $(patsubst $(SRC_DIR)/%.c,$(OBJ_DIR)/%.o,$(CSOURCES))
 DEPENDS := $(OBJECTS:.o=.d)
 
 .PHONY: all clean install
@@ -35,6 +40,10 @@ $(TARGET): $(OBJECTS)
 $(OBJ_DIR)/%.o: $(SRC_DIR)/%.cpp
 	@mkdir -p $(@D)
 	$(CXX) $(CPPFLAGS) $(EMU_CXXFLAGS) $(CXXFLAGS) -MMD -MP -c $< -o $@
+
+$(OBJ_DIR)/%.o: $(SRC_DIR)/%.c
+	@mkdir -p $(@D)
+	$(CC) -std=c99 -D_DEFAULT_SOURCE $(CPPFLAGS) $(CFLAGS) -O2 -MMD -MP -c $< -o $@
 
 clean:
 	rm -rf $(OBJ_DIR) $(BUILD_DIR)
