@@ -2,16 +2,12 @@
 
 #include "bbslist.h"
 #include "inflate.h"
+#include "netcompat.h"
 
-#include <netdb.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
-#include <sys/socket.h>
-#include <sys/time.h>
-#include <sys/types.h>
-#include <unistd.h>
 
 static char     src_host[64] = "www.telnetbbsguide.com";
 static int      src_port = 80;
@@ -39,36 +35,35 @@ const char *bbs_issue(void) { return issue; }
 static int http_get(const char *path, int (*body)(const uint8_t *p, int n, void *arg), void *arg)
 {
     struct addrinfo hints, *ai = 0;
-    struct timeval tv = { 10, 0 };
     char port[8], req[256], hdr[1024];
     int s, n, hn = 0, in_body = 0, rc = -1;
     uint8_t buf[1024];
 
     snprintf(port, sizeof port, "%d", src_port);
+    net_start();
     memset(&hints, 0, sizeof hints);
     hints.ai_family = AF_INET;
     hints.ai_socktype = SOCK_STREAM;
     if (getaddrinfo(src_host, port, &hints, &ai) != 0 || !ai) { err = "no such host"; return -1; }
-    s = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+    s = net_socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
     if (s < 0) { freeaddrinfo(ai); err = "no socket"; return -1; }
-    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
-    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
-    if (connect(s, ai->ai_addr, ai->ai_addrlen) != 0) {
-        freeaddrinfo(ai); close(s); err = "no connection"; return -1;
+    net_timeouts(s, 10);
+    if (connect(s, ai->ai_addr, (int)ai->ai_addrlen) != 0) {
+        freeaddrinfo(ai); net_close(s); err = "no connection"; return -1;
     }
     freeaddrinfo(ai);
     n = snprintf(req, sizeof req, "GET %s HTTP/1.0\r\nHost: %s\r\nUser-Agent: ComboLite\r\n\r\n",
                  path, src_host);
-    if (send(s, req, (size_t)n, 0) != n) { close(s); err = "send failed"; return -1; }
+    if (net_send(s, req, n) != n) { net_close(s); err = "send failed"; return -1; }
     err = "bad reply";
-    while ((n = (int)recv(s, buf, sizeof buf, 0)) > 0) {
+    while ((n = net_recv(s, buf, (int)sizeof buf)) > 0) {
         int i = 0;
         if (!in_body) {
             for (; i < n && !in_body; i++) {
                 if (hn < (int)sizeof hdr - 1) hdr[hn++] = (char)buf[i];
                 if (hn >= 4 && !memcmp(hdr + hn - 4, "\r\n\r\n", 4)) {
                     hdr[hn] = 0;
-                    if (strncmp(hdr, "HTTP/1.", 7) || strncmp(hdr + 9, "200", 3)) { close(s); return -1; }
+                    if (strncmp(hdr, "HTTP/1.", 7) || strncmp(hdr + 9, "200", 3)) { net_close(s); return -1; }
                     in_body = 1;
                 }
             }
@@ -77,7 +72,7 @@ static int http_get(const char *path, int (*body)(const uint8_t *p, int n, void 
         if (i < n && body(buf + i, n - i, arg)) { rc = 0; break; }
     }
     if (n == 0 && in_body) rc = 0;
-    close(s);
+    net_close(s);
     if (rc == 0) err = "";
     else if (in_body) err = "connection broken";
     return rc;

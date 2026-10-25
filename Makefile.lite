@@ -43,7 +43,7 @@ $(OBJ_DIR)/%.o: $(SRC_DIR)/%.cpp
 
 $(OBJ_DIR)/%.o: $(SRC_DIR)/%.c
 	@mkdir -p $(@D)
-	$(CC) -std=c99 -D_DEFAULT_SOURCE $(CPPFLAGS) $(CFLAGS) -O2 -MMD -MP -c $< -o $@
+	$(CC) -std=gnu99 -D_DEFAULT_SOURCE $(CPPFLAGS) $(CFLAGS) -O2 -MMD -MP -c $< -o $@
 
 clean:
 	rm -rf $(OBJ_DIR) $(BUILD_DIR)

@@ -3,18 +3,12 @@
 #include "modem.h"
 #include "bbslist.h"
 #include "fetch.h"
+#include "netcompat.h"
 
-#include <errno.h>
-#include <fcntl.h>
-#include <netdb.h>
-#include <sys/poll.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
-#include <sys/socket.h>
-#include <sys/types.h>
-#include <unistd.h>
 
 #define DIAL_TIMEOUT_MS   20000u
 #define GUARD_MS          1000u        /* тишина вокруг +++ */
@@ -109,7 +103,7 @@ static void hang_up(void)
 {
     if (gopher) fetch_close();
     gopher = 0;
-    if (sock >= 0) close(sock);
+    if (sock >= 0) net_close(sock);
     sock = -1;
     net_out_n = 0;
     online_cmd = 0;
@@ -374,7 +368,7 @@ static void dial(const char *arg, uint32_t now_ms)
     char host[64], port[8] = "23";
     const char *c;
     struct addrinfo hints, *ai = 0;
-    int fl, rc;
+    int rc;
 
     while (*arg == ' ') arg++;
     if (arg != last_dial) snprintf(last_dial, sizeof last_dial, "%s", arg);
@@ -399,17 +393,17 @@ static void dial(const char *arg, uint32_t now_ms)
         result("CONNECT");
         return;
     }
+    net_start();
     memset(&hints, 0, sizeof hints);
     hints.ai_family = AF_INET;
     hints.ai_socktype = SOCK_STREAM;
     if (getaddrinfo(host, port, &hints, &ai) != 0 || !ai) { result("NO ANSWER"); return; }
-    sock = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+    sock = net_socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
     if (sock < 0) { freeaddrinfo(ai); result("ERROR"); return; }
-    fl = fcntl(sock, F_GETFL, 0);
-    fcntl(sock, F_SETFL, fl | O_NONBLOCK);
-    rc = connect(sock, ai->ai_addr, ai->ai_addrlen);
+    net_nonblock(sock);
+    rc = connect(sock, ai->ai_addr, (int)ai->ai_addrlen);
     freeaddrinfo(ai);
-    if (rc != 0 && errno != EINPROGRESS) { hang_up(); result("NO ANSWER"); return; }
+    if (rc != 0 && !net_again()) { hang_up(); result("NO ANSWER"); return; }
     tn_reset();
     dial_ms = now_ms;
     mode = M_DIAL;
@@ -588,12 +582,8 @@ void modem_poll(uint32_t now_ms)
     if (sock < 0) return;
 
     if (mode == M_DIAL) {
-        struct pollfd pf = { sock, POLLOUT, 0 };
-        int err = 0;
-        socklen_t el = sizeof err;
-        if (poll(&pf, 1, 0) > 0) {
-            getsockopt(sock, SOL_SOCKET, SO_ERROR, &err, &el);
-            if (err) { hang_up(); result("NO ANSWER"); return; }
+        if (net_writable(sock)) {
+            if (net_error(sock)) { hang_up(); result("NO ANSWER"); return; }
             mode = M_ONLINE;
             last_in_ms = now_ms;
             conn_ms = now_ms;
@@ -606,11 +596,11 @@ void modem_poll(uint32_t now_ms)
 
     /* в сеть */
     if (net_out_n) {
-        n = (int)send(sock, net_out, (size_t)net_out_n, 0);
+        n = net_send(sock, net_out, net_out_n);
         if (n > 0) {
             memmove(net_out, net_out + n, (size_t)(net_out_n - n));
             net_out_n -= n;
-        } else if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+        } else if (n < 0 && !net_again()) {
             hang_up(); result("NO CARRIER"); return;
         }
     }
@@ -618,11 +608,11 @@ void modem_poll(uint32_t now_ms)
     n = ring_room(&to_vec) - 16;
     if (n > (int)sizeof buf) n = (int)sizeof buf;
     if (n <= 0) return;
-    n = (int)recv(sock, buf, (size_t)n, 0);
+    n = net_recv(sock, buf, n);
     if (n > 0) {
         int i;
         for (i = 0; i < n; i++) tn_in(buf[i]);
-    } else if (n == 0 || (errno != EAGAIN && errno != EWOULDBLOCK)) {
+    } else if (n == 0 || !net_again()) {
         hang_up(); result("NO CARRIER");
     }
 }
