@@ -937,7 +937,7 @@ uint8_t VectorMouse::readByte(int)
     case 2:
         return uint8_t(m_y);
     case 3:
-        return m_wheel;
+        return takeDelta(m_wheel, 1, -128, 127);   // шаги колеса с прошлого чтения, как смещения 4, 5
     case 4:
         return takeDelta(m_acc[0], 2, -128, 127);
     case 5:
@@ -995,8 +995,9 @@ bool VectorMouse::hostMouseMove(int x, int y, bool inside, int buttons)
 
 void VectorMouse::hostMouseWheel(int steps)
 {
+    // программа, что не читает колесо, копила бы без предела: больше байта копить незачем
     if (m_enabled)
-        m_wheel = uint8_t(m_wheel + steps);
+        m_wheel = std::max(-128, std::min(m_wheel + steps, 127));
 }
 
 
