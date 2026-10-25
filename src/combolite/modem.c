@@ -2,6 +2,7 @@
 
 #include "modem.h"
 #include "bbslist.h"
+#include "fetch.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -84,7 +85,7 @@ static char     last_dial[80];          /* для ATDL */
  * NICK и USER, telnet-BBS торгуется сразу. Пока вид не ясен, байты от машины
  * ждут: telnet и сырой TCP шлют их по-разному (IAC IAC, CR NUL). */
 #define CONN_WAIT_MS 1000u
-enum { C_UNKNOWN, C_TELNET, C_RAW };
+enum { C_UNKNOWN, C_TELNET, C_RAW, C_GOPHER };
 static int      conn;
 static uint32_t conn_ms;
 
@@ -93,11 +94,21 @@ static uint32_t last_in_ms;             /* последний байт от ма
 static int      plus_n;
 static uint32_t plus_ms;
 
-int modem_online(void) { return sock >= 0 && mode == M_ONLINE; }
-int modem_line(void) { return sock >= 0; }
+/* Мост «Gopher поверх HTTPS»: соединение без сокета, байты -- из fetch.h. */
+static int      gopher;                 /* 0 -- нет, 1 -- копим строку выбора, 2 -- качаем */
+static char     g_host[64];
+static char     g_sel[256];
+static int      g_sel_n;
+
+static int line_up(void) { return sock >= 0 || gopher; }
+
+int modem_online(void) { return line_up() && mode == M_ONLINE; }
+int modem_line(void) { return line_up(); }
 
 static void hang_up(void)
 {
+    if (gopher) fetch_close();
+    gopher = 0;
     if (sock >= 0) close(sock);
     sock = -1;
     net_out_n = 0;
@@ -277,13 +288,84 @@ static void local_echo(uint8_t b)
 }
 
 /* Байт от машины в сеть. */
+static void gopher_char(uint8_t b);
+
 static void tn_out(uint8_t b)
 {
+    if (conn == C_GOPHER) { gopher_char(b); return; }
     if (conn == C_RAW) { net_raw(b); return; }
     if (conn == C_TELNET && !bit(him_on, O_ECHO)) local_echo(b);
     if (b == T_IAC) { net_raw(T_IAC); net_raw(T_IAC); return; }
     net_raw(b);
     if (b == '\r' && !bit(us_on, O_BINARY)) net_raw(0);
+}
+
+/* ---------------------------------------------------------- мост Gopher
+ * GitHub Pages отдаёт только HTTPS, а GOPHER.COM ходит сырым TCP на порт 70.
+ * Набор хоста *.github.io на порт 70 соединяет не с сетью, а с мостом:
+ * CONNECT сразу, строка выбора -- до CR или LF (запрос поиска после ТАБ --
+ * мимо: там статика), файл -- https://хост/путь (пустой путь или с «/» на
+ * конце -- index.gph), его байты -- как ответ сервера Gopher, конец --
+ * NO CARRIER, как при закрытии TCP. Не вышло -- меню из одной строки-ошибки.
+ * Скачивание -- fetch.h: на плате esp_http_client, на маке curl. */
+static int gopher_host(const char *host, const char *port)
+{
+    static const char tail[] = ".github.io";
+    size_t hl = strlen(host), tl = sizeof tail - 1;
+    return !strcmp(port, "70") && hl > tl && !strcasecmp(host + hl - tl, tail);
+}
+
+static void gopher_end(const char *error)
+{
+    if (error) {
+        say("3"); say(error); say("\t\terror.host\t1\r\n.\r\n");
+    }
+    hang_up();
+    result("NO CARRIER");
+}
+
+/* Строка выбора пришла: путь -> адрес. В адресе остаются только буквы, цифры
+ * и -._~/%, прочее -- процентами: так он годится и в оболочку (curl). */
+static void gopher_start(void)
+{
+    static const char hex[] = "0123456789ABCDEF";
+    char url[512];
+    size_t n;
+    int i;
+
+    n = (size_t)snprintf(url, sizeof url, "https://%s", g_host);
+    if (g_sel[0] != '/') url[n++] = '/';
+    for (i = 0; i < g_sel_n && g_sel[i] != '\t' && n < sizeof url - 16; i++) {
+        uint8_t c = (uint8_t)g_sel[i];
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+            strchr("-._~/%", c)) url[n++] = (char)c;
+        else { url[n++] = '%'; url[n++] = hex[c >> 4]; url[n++] = hex[c & 15]; }
+    }
+    if (url[n - 1] == '/') { memcpy(url + n, "index.gph", 9); n += 9; }
+    url[n] = 0;
+    if (fetch_open(url) != 0) { gopher_end("Bridge busy, try again"); return; }
+    gopher = 2;
+}
+
+static void gopher_char(uint8_t b)
+{
+    if (gopher != 1) return;            /* строка выбора уже ушла: остальное мимо */
+    if (b == '\r' || b == '\n') { gopher_start(); return; }
+    if (g_sel_n < (int)sizeof g_sel - 1) g_sel[g_sel_n++] = (char)b;
+}
+
+/* Скачанное -- машине, сколько влезет. */
+static void gopher_pump(void)
+{
+    uint8_t buf[256];
+    int n = ring_room(&to_vec) - 16, i;
+
+    if (n > (int)sizeof buf) n = (int)sizeof buf;
+    if (n <= 0) return;
+    n = fetch_read(buf, n);
+    if (n > 0) { for (i = 0; i < n; i++) ring_put(&to_vec, buf[i]); return; }
+    if (n == FETCH_DONE) gopher_end(0);
+    else if (n == FETCH_FAIL) gopher_end(fetch_status() ? "Not found" : "Cannot reach the site");
 }
 
 /* ---------------------------------------------------------- набор */
@@ -305,6 +387,17 @@ static void dial(const char *arg, uint32_t now_ms)
     } else {
         if (!*arg || strlen(arg) >= sizeof host) { result("ERROR"); return; }
         strcpy(host, arg);
+    }
+    if (gopher_host(host, port)) {      /* мост: сеть -- за fetch.h */
+        snprintf(g_host, sizeof g_host, "%s", host);
+        g_sel_n = 0;
+        gopher = 1;
+        tn_reset();
+        conn = C_GOPHER;
+        mode = M_ONLINE;
+        last_in_ms = now_ms;
+        result("CONNECT");
+        return;
     }
     memset(&hints, 0, sizeof hints);
     hints.ai_family = AF_INET;
@@ -407,9 +500,9 @@ static void command(uint32_t now_ms)
         case 'H': if (*p == '0') p++; hang_up(); break;
         case 'I': if (*p >= '0' && *p <= '9') p++;
                   say("\r\n" MODEM_NAME); break;
-        case 'O': if (sock < 0) { result("NO CARRIER"); return; }
+        case 'O': if (!line_up()) { result("NO CARRIER"); return; }
                   online_cmd = 0; mode = M_ONLINE; result("CONNECT"); return;
-        case 'D': if (sock >= 0) { hang_up(); say("\r\nHung up the old line"); }   /* новый набор -- старое прочь */
+        case 'D': if (line_up()) { hang_up(); say("\r\nHung up the old line"); }   /* новый набор -- старое прочь */
                   if (*p == 'S' || *p == 's') { cmd_dial_stored(p + 1, now_ms); return; }
                   if (*p == 'L' || *p == 'l') {
                       if (!last_dial[0]) { result("ERROR"); return; }
@@ -491,6 +584,7 @@ void modem_poll(uint32_t now_ms)
         result("OK");
     }
 
+    if (gopher == 2) gopher_pump();
     if (sock < 0) return;
 
     if (mode == M_DIAL) {

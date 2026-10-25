@@ -275,6 +275,7 @@ unix {
     QMAKE_CFLAGS += -std=c99 -D_DEFAULT_SOURCE
     SOURCES += \
         combolite/bbslist.c \
+        combolite/fetch_curl.c \
         combolite/inflate.c \
         combolite/modem.c \
         combolite/vchan.c \
@@ -283,6 +284,7 @@ unix {
         combolite/bbslist.h \
         combolite/board.h \
         combolite/combo.h \
+        combolite/fetch.h \
         combolite/inflate.h \
         combolite/modem.h \
         combolite/vchan.h
