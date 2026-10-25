@@ -268,27 +268,27 @@ win32:RC_FILE = qt/emu80.rc
 
 macx:ICON = qt/icons/emu80.icns
 
-# Wi-Fi модем платы ComboLite (VectorModem): код ESP платы, копией в combolite/. Он на сокетах
-# POSIX, поэтому на Windows модема нет: порты 28h-2Dh читаются как FFh.
-unix {
-    DEFINES += VECTOR_MODEM
-    QMAKE_CFLAGS += -std=c99 -D_DEFAULT_SOURCE
-    SOURCES += \
+# Wi-Fi модем платы ComboLite (VectorModem): код ESP платы, копией в combolite/. Сокеты --
+# через combolite/netcompat.h: POSIX на маке и в Linux, Winsock в Windows.
+DEFINES += VECTOR_MODEM
+QMAKE_CFLAGS += -std=gnu99 -D_DEFAULT_SOURCE
+win32:LIBS += -lws2_32
+SOURCES += \
         combolite/bbslist.c \
         combolite/fetch_curl.c \
         combolite/inflate.c \
         combolite/modem.c \
         combolite/vchan.c \
         combolite/vchan_sim.c
-    HEADERS += \
+HEADERS += \
         combolite/bbslist.h \
         combolite/board.h \
         combolite/combo.h \
         combolite/fetch.h \
         combolite/inflate.h \
         combolite/modem.h \
+        combolite/netcompat.h \
         combolite/vchan.h
-}
 
 BUILDDIR = build
 OBJECTS_DIR = $${BUILDDIR}/obj

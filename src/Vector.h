@@ -432,7 +432,6 @@ class VectorRamDiskSelector : public AddressableDevice
 // идёт в интернет. Вместо ПЛИС и SPI -- модель канала из vchan_sim.c. ESP опрашивается раз в
 // миллисекунду времени «Вектора» и при обращении к порту. Регистр квазидиска (порт 10h) и палитру
 // модем отдаёт по запросу DIAG: TERM.COM, IRC.COM и GOPHER.COM возвращают их ОС на выходе.
-// На Windows модема нет (код ESP -- на сокетах POSIX): порты читаются как FFh.
 class VectorModem : public AddressableDevice, public IActive
 {
     public:
