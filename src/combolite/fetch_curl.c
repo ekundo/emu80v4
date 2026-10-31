@@ -118,6 +118,24 @@ int fetch_open(const char *url)
     return 0;
 }
 
+#ifndef _WIN32
+/* Какой openssl звать. Программа, запущенная из Finder (Emu80, v06x.app), не
+ * видит PATH оболочки и нашла бы только системный LibreSSL: он не знает
+ * -verify_hostname и сверяет лишь цепочку сертификата. Поэтому сперва --
+ * OpenSSL из Homebrew по полному пути; его нет -- системный, с проверкой
+ * цепочки без имени хоста. *full -- можно ли -verify_hostname. */
+static const char *ossl(int *full)
+{
+    static const char *const paths[] = { "/opt/homebrew/bin/openssl", "/usr/local/bin/openssl", 0 };
+    int i;
+
+    for (i = 0; paths[i]; i++)
+        if (access(paths[i], X_OK) == 0) { *full = 1; return paths[i]; }
+    *full = 0;
+    return "openssl";
+}
+#endif
+
 /* Gemini -- openssl s_client: запрос идёт ему на вход, ответ -- в трубу. С
  * -quiet он не печатает сертификат и не выходит по концу входа, а ждёт, пока
  * сервер закроет соединение. Сервер часто закрывает без close_notify, и
@@ -130,6 +148,7 @@ int fetch_gemini(const char *host, int port, const char *url, int trust_new)
 #else
     char cmd[1600], to[96];
     const char *alt = getenv("COMBO_GEMINI_CONNECT");
+    int full;
 
     (void)trust_new;
     if (RUNNING) return -1;
@@ -137,8 +156,8 @@ int fetch_gemini(const char *host, int port, const char *url, int trust_new)
     if (alt && *alt) snprintf(to, sizeof to, "%s", alt);
     else snprintf(to, sizeof to, "%s:%d", host, port);
     snprintf(cmd, sizeof cmd,
-             "printf '%%s\\r\\n' '%s' | openssl s_client -quiet -connect '%s' -servername '%s' 2>/dev/null",
-             url, to, host);
+             "printf '%%s\\r\\n' '%s' | %s s_client -quiet -connect '%s' -servername '%s' 2>/dev/null",
+             url, ossl(&full), to, host);
     pipe_f = popen(cmd, "r");
     if (!pipe_f) return -1;
     fcntl(fileno(pipe_f), F_SETFL, fcntl(fileno(pipe_f), F_GETFL, 0) | O_NONBLOCK);
@@ -230,17 +249,19 @@ static pid_t tls_pid;
 int tls_open(const char *host, int port)
 {
     char cmd[512], to[96];
-    const char *alt = getenv("COMBO_TLS_CONNECT");
-    int pin[2], pout[2];
+    const char *alt = getenv("COMBO_TLS_CONNECT"), *o;
+    int pin[2], pout[2], full;
 
     if (tls_pid || strchr(host, '\'')) return -1;
+    o = ossl(&full);
     if (alt && *alt)                    /* стенд: свой сервер, самоподписанный */
-        snprintf(cmd, sizeof cmd, "exec openssl s_client -quiet -connect '%s' -servername '%s' 2>/dev/null",
-                 alt, host);
+        snprintf(cmd, sizeof cmd, "exec %s s_client -quiet -connect '%s' -servername '%s' 2>/dev/null",
+                 o, alt, host);
     else {
         snprintf(to, sizeof to, "%s:%d", host, port);
-        snprintf(cmd, sizeof cmd, "exec openssl s_client -quiet -verify_return_error -verify_hostname '%s'"
-                 " -connect '%s' -servername '%s' 2>/dev/null", host, to, host);
+        snprintf(cmd, sizeof cmd, "exec %s s_client -quiet -verify_return_error%s%s%s"
+                 " -connect '%s' -servername '%s' 2>/dev/null",
+                 o, full ? " -verify_hostname '" : "", full ? host : "", full ? "'" : "", to, host);
     }
     if (pipe(pin)) return -1;
     if (pipe(pout)) { close(pin[0]); close(pin[1]); return -1; }
