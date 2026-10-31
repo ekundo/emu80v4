@@ -40,7 +40,8 @@
 #define C_VGA      0x4E         /* + режим VGA: разряд 0 -- 800x600@60, иначе 50 Гц с привязкой к машине */
 #define C_FDC_PC   0x4F         /* + предкомпенсация ВГ93: 3..0 шаги по 62,5 нс (0 нет), 4 -- только с 44-й дорожки */
 #define C_BOOT     0x56         /* + разряд 0: после ВВОД с клавиатуры -- подставной загрузчик (hdl/rom_sense.v);
-                                   разряд 1: автозапуск загруженного, BOOT26 и ПЗУ (hdl/fakerom.v) */
+                                   разряд 1: автозапуск загруженного, BOOT26 и ПЗУ (hdl/fakerom.v);
+                                   разряд 2 (rev5): узнанный ВВОД держит машину, пока ESP льёт квазидиск (VFD_KDREQ) */
 #define C_SCRROW   0x52         /* + строка картинки y: заявка на строку экрана (scr_buf.v) */
 #define C_SCRRD    0x53         /* дальше 131 байт: A5h/00 готово, y, прокрутка, 128 байт (слой 0..3 x колонка 0..31) */
 #define C_PALRD    0x57         /* дальше 17 байт: палитра машины, ячейки 0..15, BBGGGRRR, и порт B {0,0,0,512,бордюр} (hdl/vid_rec.v) */
@@ -71,6 +72,55 @@
 #define C_SEC_RD  0x50
 #define C_SEC_WR  0x51
 
+/* rev5 (doc/REV5.md, «Прошивка ПЛИС»; шапки hdl/ide_remote.v, ide_emu.v,
+   esp_mem.v). Привода нет: перенос блока ходит в статику по указателю, а
+   0x10|N и 0x20|N -- регистры винта, который ПЛИС изображает «Вектору». */
+#define C_XADDR    0x5A         /* + 3 байта: {микросхема, страница 3, A15..A0} */
+#define C_KDD      0x5B         /* дальше 2 байта: изменённые блоки квазидиска по 32 КБ, чтение гасит */
+#define C_SEC_WR_N 0x5C         /* | номер: буфер N -> статика */
+#define C_BUF_WR_N 0x5E         /* | номер: запись буфера N по SPI */
+#define C_VFDST    0x07         /* дальше байт: виртуальный дисковод (VFD_*) */
+#define C_QUAD     0x80         /* | код: после байта команды -- по четырём линиям */
+
+/* Регистр винта 7 со стороны ESP: младший байт -- состояние для машины,
+   старший -- действия (hdl/ide_emu.v). */
+#define EMU_GO      0x01        /* начать обмен буфером */
+#define EMU_DIR     0x02        /* машина пишет буфер (иначе читает) */
+#define EMU_BUF1    0x04        /* буфер 1 (иначе 0) */
+#define EMU_ACK     0x08        /* снять pend, done и признак сброса */
+#define EMU_MASTER  0x10        /* привод 0 есть */
+#define EMU_SLAVE   0x20        /* привод 1 есть */
+/* Флаги винта: регистр 0 и старший байт любого чтения регистра. */
+#define EF_BUF1     0x01
+#define EF_DIR      0x02
+#define EF_DRQ      0x04
+#define EF_PEND     0x08        /* машина записала команду */
+#define EF_DONE     0x10        /* машина дочитала или дописала буфер */
+#define EF_RESET    0x20        /* машина сбрасывалась */
+#define EF_SLAVE    0x40
+#define EF_MASTER   0x80
+
+/* Байт C_VFDST. */
+#define VFD_SEL     0x01        /* ядро выбрало виртуальный привод */
+#define VFD_MOTOR   0x02
+#define VFD_IS_A    0x04
+#define VFD_IS_B    0x08
+#define VFD_SIDE1   0x10
+#define VFD_KDREQ   0x20        /* ВВОД с клавиатуры узнан, ПЛИС держит ВВОД: залить квазидиск */
+
+/* rev5: джойстики от геймпада (hdl/top.v, «джойстики»). */
+#define C_JOY       0x01        /* + три байта: как читать 0Eh, 0Fh и 27h */
+#define C_JOY_OFF   0x02        /* геймпада нет: порты молчат */
+
+/* rev5: ВГ93 у ESP (hdl/fdc_esp.v). */
+#define C_FE_CTL    0x03        /* + байт: разряд 0 -- взять контроллер, иначе отдать */
+#define C_FE_REG    0x04        /* + {запись, n} + байт + ответ: регистр 18h + n */
+#define C_FE_RD     0x05        /* дальше FE_ST_*, потом байты очереди */
+#define C_FE_WR     0x06        /* дальше байты в очередь */
+#define FE_ST_KNOCK 0x80        /* «Вектор» полез в дисковод, пока он у ESP */
+#define FE_ST_COUNT 0x7F        /* байт в очереди, 0..64 */
+#define FE_QUEUE    64          /* 2 мс данных: больше такта FreeRTOS */
+
 /* состояние — первый байт любого ответа */
 #define ST_GRANT    0x01        /* шина захвачена */
 #define ST_CYC      0x02        /* идёт цикл обращения к приводу */
@@ -79,6 +129,7 @@
 #define ST_LONG     0x10        /* запрошено долгое владение */
 #define ST_QUIET    0x20        /* процессор молчит дольше порога: писать можно */
 #define ST_CPU_SEEN 0x40        /* процессор трогал привод, липкий до C_SEEN_CLR */
+#define ST_EMU      0x40        /* rev5: винт ждёт ESP (EF_PEND, EF_DONE, EF_RESET) */
 #define ST_ALIVE    0x80        /* всегда 1: отличить от оборванной линии */
 
 #define COMBO_SECTOR 512
@@ -194,9 +245,59 @@ void    combo_scr_peek(uint8_t *ready, uint8_t *row);
  * «Вектор» очистил канал с прошлого опроса. -1 -- канала нет: старый
  * битстрим отвечает на 0x58 состоянием, у которого разряд 7 всегда единица,
  * а здесь первый байт -- {0, flushed, пусто, 10101}. Иначе -- сколько взято. */
+/* Счетчики канала для журнала ESP (vchan_esp.c): опросы, отказы, байты туда и
+ * обратно, очистки и последний байт состояния от ПЛИС. */
+typedef struct { uint32_t polls, bad, in, out, flushes; uint8_t first; } combo_chan_stat_t;
+extern combo_chan_stat_t combo_chan_stat;
 int     combo_chan_read(uint8_t *buf, int max, int *free, int *flushed);
 /* Положить n байт в очередь к «Вектору». Места ПЛИС не проверяет за нас:
  * лишнее пропадает, поэтому n -- не больше *free из последнего чтения. */
 void    combo_chan_write(const uint8_t *buf, int n);
+
+/* ---------------------------------------------------------------- rev5
+ *
+ * Битстрим rev5 опознаётся по C_VFDST: старый отвечает на 0x07 состоянием, у
+ * которого разряд 7 всегда единица, а у байта виртуального дисковода он ноль. */
+int     combo_rev5_probe(void);
+/* Четыре линии для буферов (combo_buf_*_n): только если ПЛИС rev5 и
+ * транспорт умеет (link_quad). Включает board.c после опознания. */
+void    combo_set_quad(int on);
+/* Строка экрана (C_SCRRD) по четырём линиям: идёт, пока не выключена. */
+int     combo_scr_quad(void);
+void    combo_scr_quad_off(void);
+
+void    combo_buf_write_n(int buf, const uint8_t *src);    /* 512 байт */
+void    combo_block_write_n(int buf);                      /* буфер N -> статика, не ждёт */
+/* Указатель статики для переноса блока: {микросхема, страница, A15..A0}.
+ * Адрес -- как у процессора, перестановку линий делает ПЛИС (esp_mem.v);
+ * после каждого слова указатель прибавляет 2. Байт по указателю -- первый
+ * байт пары в буфере. */
+void    combo_xaddr(uint32_t a);
+void    combo_kd_dirty(uint8_t map[2]);
+uint8_t combo_vfd_state(void);
+
+/* Статика -> буфер N по указателю (тот же перенос, что винт), не ждёт. */
+void    combo_block_read_n(int buf);
+
+/* Джойстики: c1, c2 -- джойстики «С» (0Eh, 0Fh), u -- УСПИД (27h). */
+void    combo_joy(uint8_t c1, uint8_t c2, uint8_t u);
+void    combo_joy_off(void);
+
+/* ВГ93 у ESP. Регистр n: 0 данные, 1 сектор, 2 дорожка, 3 команда и
+ * состояние, 4 -- выбор привода и стороны (1Ch). */
+void    combo_fe_take(int on);
+void    combo_fe_write(int n, uint8_t v);
+uint8_t combo_fe_read(int n);
+uint8_t combo_fe_state(void);                      /* FE_ST_* */
+void    combo_fe_qread(uint8_t *dst, int n);       /* n не больше FE_ST_COUNT */
+void    combo_fe_qwrite(const uint8_t *src, int n);
+
+/* Винт (hdl/ide_emu.v). */
+int     combo_emu_flags(uint8_t *flags);
+/* Регистры, как их написала машина: r[2..6] -- счётчик, сектор, цилиндр,
+ * привод/головка; r[7] -- команда; r[0] -- флаги, r[1] -- ошибка. */
+int     combo_emu_regs(uint8_t r[8]);
+int     combo_emu_post(uint8_t status, uint8_t act);
+int     combo_emu_error(uint8_t err);
 
 #endif
