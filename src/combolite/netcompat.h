@@ -18,6 +18,7 @@
 #endif
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <string.h>
 
 static inline int net_start(void)
 {
@@ -61,12 +62,19 @@ static inline void net_timeouts(int s, int sec)
 }
 static inline int  net_send(int s, const void *p, int n) { return send((SOCKET)s, (const char *)p, n, 0); }
 static inline int  net_recv(int s, void *p, int n) { return recv((SOCKET)s, (char *)p, n, 0); }
+static inline int  net_accept(int ls)
+{
+    SOCKET c = accept((SOCKET)ls, 0, 0);
+    return c == INVALID_SOCKET ? -1 : (int)c;
+}
 
 #else
 
 #include <errno.h>
 #include <fcntl.h>
 #include <netdb.h>
+#include <netinet/in.h>
+#include <string.h>
 #include <sys/poll.h>
 #include <sys/socket.h>
 #include <sys/time.h>
@@ -99,7 +107,24 @@ static inline void net_timeouts(int s, int sec)
 }
 static inline int  net_send(int s, const void *p, int n) { return (int)send(s, p, (size_t)n, 0); }
 static inline int  net_recv(int s, void *p, int n) { return (int)recv(s, p, (size_t)n, 0); }
+static inline int  net_accept(int ls) { return accept(ls, 0, 0); }
 
 #endif
+
+/* Слушающий неблокирующий сокет TCP на всех адресах. -1 -- порт не взят. */
+static inline int net_listen(unsigned short port)
+{
+    struct sockaddr_in a;
+    int s = net_socket(AF_INET, SOCK_STREAM, 0), on = 1;
+    if (s < 0) return -1;
+    setsockopt(s, SOL_SOCKET, SO_REUSEADDR, (const char *)&on, sizeof on);
+    memset(&a, 0, sizeof a);
+    a.sin_family = AF_INET;
+    a.sin_port = htons(port);
+    a.sin_addr.s_addr = htonl(INADDR_ANY);
+    if (bind(s, (struct sockaddr *)&a, sizeof a) != 0 || listen(s, 1) != 0) { net_close(s); return -1; }
+    net_nonblock(s);
+    return s;
+}
 
 #endif

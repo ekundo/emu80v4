@@ -39,6 +39,8 @@ static FILE *pipe_f;
 #endif
 static int   status;
 static int   state;                     /* 0 -- нет, 1 -- идёт, 2 -- кончилось, 3 -- не вышло */
+static int   gem;                       /* идёт Gemini: конец трубы с байтами -- не ошибка */
+static long  got;
 
 #ifdef _WIN32
 static int spawn(char *cmd)
@@ -111,7 +113,41 @@ int fetch_open(const char *url)
 #endif
     status = 0;
     state = 1;
+    gem = 0;
+    got = 0;
     return 0;
+}
+
+/* Gemini -- openssl s_client: запрос идёт ему на вход, ответ -- в трубу. С
+ * -quiet он не печатает сертификат и не выходит по концу входа, а ждёт, пока
+ * сервер закроет соединение. Сервер часто закрывает без close_notify, и
+ * openssl выходит с ошибкой -- поэтому ответ с байтами считается целым. */
+int fetch_gemini(const char *host, int port, const char *url, int trust_new)
+{
+#ifdef _WIN32
+    (void)host; (void)port; (void)url; (void)trust_new;
+    return -1;
+#else
+    char cmd[1600], to[96];
+    const char *alt = getenv("COMBO_GEMINI_CONNECT");
+
+    (void)trust_new;
+    if (RUNNING) return -1;
+    if (strchr(url, '\'') || strchr(host, '\'')) return -1;   /* идут в командную строку в кавычках */
+    if (alt && *alt) snprintf(to, sizeof to, "%s", alt);
+    else snprintf(to, sizeof to, "%s:%d", host, port);
+    snprintf(cmd, sizeof cmd,
+             "printf '%%s\\r\\n' '%s' | openssl s_client -quiet -connect '%s' -servername '%s' 2>/dev/null",
+             url, to, host);
+    pipe_f = popen(cmd, "r");
+    if (!pipe_f) return -1;
+    fcntl(fileno(pipe_f), F_SETFL, fcntl(fileno(pipe_f), F_GETFL, 0) | O_NONBLOCK);
+    status = 0;
+    state = 1;
+    gem = 1;
+    got = 0;
+    return 0;
+#endif
 }
 
 /* Сколько байт трубы можно прочесть, не блокируясь: >0, 0 -- пока нечего,
@@ -139,8 +175,9 @@ int fetch_read(uint8_t *buf, int max)
 
     if (state == 2) return FETCH_DONE;
     if (state != 1 || !RUNNING) return FETCH_FAIL;
-    n = pipe_read(buf, max);
-    if (n > 0) return n;
+    if (gem && got >= FETCH_MAX) n = -1;        /* дальше «Вектору» всё равно не уместить */
+    else n = pipe_read(buf, max);
+    if (n > 0) { got += n; return n; }
     if (n == 0) return 0;
 #ifdef _WIN32
     code = finish();                    /* конец трубы: как вышел curl */
@@ -151,8 +188,8 @@ int fetch_read(uint8_t *buf, int max)
         pipe_f = 0;
     }
 #endif
-    if (code == 0) { state = 2; return FETCH_DONE; }
-    status = code == 22 ? 404 : 0;
+    if (code == 0 || (gem && got > 0)) { state = 2; return FETCH_DONE; }
+    status = code == 22 && !gem ? 404 : 0;
     state = 3;
     return FETCH_FAIL;
 }
@@ -172,3 +209,91 @@ void fetch_close(void)
 #endif
     state = 0;
 }
+
+/* ---------------------------------------------------------- TLS-туннель
+ * openssl s_client с двумя трубами: вход -- байты от «Вектора», выход -- к
+ * нему. С -quiet он молчит о сертификате и не выходит по концу входа.
+ * Соединился ли он, снаружи не видно: туннель «готов» сразу, а не вышло --
+ * труба кончится, и модем скажет NO CARRIER. */
+#ifdef _WIN32
+int  tls_open(const char *host, int port) { (void)host; (void)port; return -1; }
+int  tls_ready(void) { return -1; }
+int  tls_write(const uint8_t *buf, int n) { (void)buf; (void)n; return 0; }
+int  tls_read(uint8_t *buf, int max) { (void)buf; (void)max; return FETCH_FAIL; }
+void tls_close(void) {}
+#else
+#include <signal.h>
+
+static int   tls_in = -1, tls_outfd = -1;      /* в openssl, из openssl */
+static pid_t tls_pid;
+
+int tls_open(const char *host, int port)
+{
+    char cmd[512], to[96];
+    const char *alt = getenv("COMBO_TLS_CONNECT");
+    int pin[2], pout[2];
+
+    if (tls_pid || strchr(host, '\'')) return -1;
+    if (alt && *alt)                    /* стенд: свой сервер, самоподписанный */
+        snprintf(cmd, sizeof cmd, "exec openssl s_client -quiet -connect '%s' -servername '%s' 2>/dev/null",
+                 alt, host);
+    else {
+        snprintf(to, sizeof to, "%s:%d", host, port);
+        snprintf(cmd, sizeof cmd, "exec openssl s_client -quiet -verify_return_error -verify_hostname '%s'"
+                 " -connect '%s' -servername '%s' 2>/dev/null", host, to, host);
+    }
+    if (pipe(pin)) return -1;
+    if (pipe(pout)) { close(pin[0]); close(pin[1]); return -1; }
+    signal(SIGPIPE, SIG_IGN);           /* openssl вышел -- запись не должна убить эмулятор */
+    tls_pid = fork();
+    if (tls_pid < 0) { tls_pid = 0; close(pin[0]); close(pin[1]); close(pout[0]); close(pout[1]); return -1; }
+    if (tls_pid == 0) {
+        dup2(pin[0], 0);
+        dup2(pout[1], 1);
+        close(pin[0]); close(pin[1]); close(pout[0]); close(pout[1]);
+        execl("/bin/sh", "sh", "-c", cmd, (char *)0);
+        _exit(127);
+    }
+    close(pin[0]);
+    close(pout[1]);
+    tls_in = pin[1];
+    tls_outfd = pout[0];
+    fcntl(tls_in, F_SETFL, fcntl(tls_in, F_GETFL, 0) | O_NONBLOCK);
+    fcntl(tls_outfd, F_SETFL, fcntl(tls_outfd, F_GETFL, 0) | O_NONBLOCK);
+    return 0;
+}
+
+int tls_ready(void) { return tls_pid ? 1 : -1; }
+
+int tls_write(const uint8_t *buf, int n)
+{
+    ssize_t r;
+
+    if (tls_in < 0) return 0;
+    r = write(tls_in, buf, (size_t)n);
+    return r > 0 ? (int)r : 0;
+}
+
+int tls_read(uint8_t *buf, int max)
+{
+    ssize_t n;
+
+    if (tls_outfd < 0) return FETCH_FAIL;
+    n = read(tls_outfd, buf, (size_t)max);
+    if (n > 0) return (int)n;
+    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return 0;
+    return FETCH_DONE;
+}
+
+void tls_close(void)
+{
+    if (tls_in >= 0) close(tls_in);
+    if (tls_outfd >= 0) close(tls_outfd);
+    tls_in = tls_outfd = -1;
+    if (tls_pid) {
+        kill(tls_pid, SIGTERM);
+        waitpid(tls_pid, 0, 0);
+    }
+    tls_pid = 0;
+}
+#endif
