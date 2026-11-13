@@ -87,10 +87,10 @@ static int x_open(void *c, int n, pcm_src_t *src)
     return rc;
 }
 
-static int x_open_mem(void *c, const uint8_t *data, long len, pcm_src_t *src)
+static int x_open_mem(void *c, uint8_t *const *d, const long *have, long size, pcm_src_t *src)
 {
     (void)c;
-    return pcm_src_open_mem(data, len, src);
+    return pcm_src_open_mem(d, have, size, src);
 }
 
 static int x_mem_read(void *c, uint16_t a, uint8_t *dst, int n)
@@ -131,7 +131,8 @@ void pcm_host_step(int16_t *l, int16_t *r)
 {
     if (!on) { *l = *r = 0; return; }
     if (--until_tick <= 0) {
-        /* как pcm_task: идёт почта -- раз в 1 мс, играет -- 5 мс, тишина -- 20 мс */
+        /* как pcm_task: идёт почта или режим игры -- раз в 1 мс, играет -- 5 мс,
+         * тишина -- 20 мс */
         int s = pcm_tick(8);
         period = s == 2 ? PCM_HOST_RATE / 1000 : s == 1 ? PCM_HOST_RATE / 200 : PCM_HOST_RATE / 50;
         until_tick = period;

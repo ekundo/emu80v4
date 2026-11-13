@@ -33,7 +33,7 @@ int sim_saves;
 int board_settings_valid(const board_settings_t *s)
 {
     return !(s->dev_off & ~DEV_MASK) && s->fdc_rdy <= 2 && s->fdc_pc <= 0x1F
-        && s->vga60 <= 1 && s->vi53_off <= 1 && s->boot <= BOOT_VVOD
+        && s->vga60 <= 2 && s->vi53_off <= 1 && s->boot <= BOOT_VVOD
         && s->fdd_cable <= 1 && s->autostart <= 1;
 }
 void    board_get(board_settings_t *out) { *out = cur; }
