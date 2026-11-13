@@ -63,8 +63,8 @@ static voice_t   fx, fx_old;
  * повисла или «Вектор» сброшен: музыка и эффект гаснут, режим игры
  * выключается. Время -- по выходу ПЛИС (play_frame): в режиме игры он идёт
  * всегда. После срабатывания короткая почта не значит ничего (иначе эффект N
- * от ожившей игры пустил бы дорожку N с карты), пока не придёт длинная
- * команда. */
+ * от ожившей игры пустил бы дорожку N с карты), пока не придёт 07h. FFh
+ * вне режима игры -- тоже ничего: загрузчик пинает и до 07h. */
 #define WD_DEFAULT 20                   /* 2 с */
 static int       wd_t = WD_DEFAULT, wd_dead;
 static int       wd_kick;               /* пинок пришёл, отметку ещё не взяли */
@@ -389,7 +389,8 @@ void pcm_command(int cmd)
         else if (cmd != 0xFF) err = 1;      /* FFh -- пинок: разряд 2 не трогает */
         return;
     }
-    if (wd_dead) { err = 1; return; }       /* сторож сработал: ждём длинную */
+    if (cmd == 0xFF) return;                /* пинок и вне режима игры: загрузчик пинает до 07h */
+    if (wd_dead) { err = 1; return; }       /* сторож сработал: ждём 07h */
     if (cmd == 0x00) { stop_music(); return; }
     src_close();
     memset(&src, 0, sizeof src);
@@ -538,7 +539,6 @@ static void ext_command(void)
 {
     uint8_t b[6];
     int ok = 0, k;
-    wd_dead = 0;
     if (ops.mem_read(ops.ctx, ext_a, b, sizeof b) == 0) {
         k = b[1];
         switch (b[0]) {
@@ -571,7 +571,7 @@ static void ext_command(void)
             ok = fx_table(k, (uint16_t)le16(b + 2)) == 0;
             break;
         case PCM_OP_GAME:
-            if (k <= 1) { game(k); ok = 1; }
+            if (k <= 1) { game(k); wd_dead = 0; ok = 1; }
             break;
         case PCM_OP_STOP:
             if (k & 1) music_off();
