@@ -16,7 +16,8 @@ static uint32_t rp;                             /* указатель чтени
 static uint16_t lim;                            /* первый незаписанный блок */
 static uint8_t  ctl;                            /* от ESP: разряд 0 -- играть, 7..1 -- «Вектору» */
 static uint8_t  mb, full;                       /* почта «Вектора» */
-static uint8_t  out_l = 0x80, out_r = 0x80;     /* выход держит последний отсчёт; с 80h -- без щелчка при включении */
+static int      out_l, out_r;                   /* выход держит последний отсчёт, 16 бит; с середины -- без щелчка при включении */
+static uint8_t  sh_l, sh_r;                     /* сдвиги блока (первая пара байт блока, pcm_play.h) */
 static int      on;
 
 static char            music[1024];
@@ -139,9 +140,15 @@ void pcm_host_step(int16_t *l, int16_t *r)
     }
     /* ПЛИС: играть, пока указатель не дошёл до границы; иначе держать последний */
     if ((ctl & 1) && rp / PCM_BLK != lim) {
-        out_l = ring[rp]; out_r = ring[rp + 1];
+        if (rp % PCM_BLK == 0) {                /* пара сдвигов: не отсчёт, сразу следующая */
+            sh_l = ring[rp] & 7; sh_r = ring[rp + 1] & 7;
+            rp += 2;
+        }
+        /* как ПЛИС (12 разрядов, (q - 80h) << 4 >>> s), в шкале 16 бит */
+        out_l = (ring[rp] - 128) * (256 >> sh_l);
+        out_r = (ring[rp + 1] - 128) * (256 >> sh_r);
         rp = (rp + 2) % sizeof ring;
     }
-    *l = dc_block(0, (out_l - 128) * 256);
-    *r = dc_block(1, (out_r - 128) * 256);
+    *l = dc_block(0, out_l);
+    *r = dc_block(1, out_r);
 }

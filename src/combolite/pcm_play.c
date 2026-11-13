@@ -6,7 +6,8 @@
 
 #define RAMP  512                       /* кадров плавного входа и выхода, 11,6 мс */
 #define INBUF 2304                      /* отсчётов источника за раз (кадр MP3 стерео) */
-#define FRAMES (PCM_BLK / 2)            /* кадров в блоке кольца */
+#define FRAMES PCM_FRAMES               /* кадров в блоке кольца (первый -- сдвиги) */
+#define LOW   (-32768)                  /* низ шкалы: выход «в ноль» */
 #define MIR   16                        /* блоков музыки без эффекта: больше PCM_GAME_AHEAD */
 #define FX_EDGE 32                      /* кадров плавного края эффекта, 0,7 мс */
 
@@ -26,7 +27,7 @@ static int       in_n, in_i;            /* кадров в inb, следующи
 static uint32_t  frac, step;            /* позиция между кадрами a и b, 16.16 */
 static int       a_l, a_r, b_l, b_r;
 static int       ramp_in, ramp_out;     /* кадров осталось */
-static uint8_t   last_l, last_r;        /* последний выданный отсчёт */
+static int       last_l, last_r;        /* последний выданный отсчёт, 16 бит со знаком */
 static int       done;                  /* всё выдано, дальше только тишина */
 static unsigned long under;             /* недоборов */
 static int       starved;               /* ПЛИС стоит на границе (считан один раз) */
@@ -78,7 +79,7 @@ void pcm_init(const pcm_ops_t *o)
     int k;
     ops = *o;
     st = S_IDLE; run = 0; err = 0; ready = 1; wblk = 0; wabs = 0; rp = 0;
-    src_on = 0; done = 1; last_l = last_r = 0;
+    src_on = 0; done = 1; last_l = last_r = LOW;
     ext_n = 0; playing_slot = 0;
     gm = 0; fx_n = 0; fx.k = fx_old.k = 0; fx_vol = 16;
     wd_t = WD_DEFAULT; wd_dead = 0; wd_kick = 0; wd_last = 0; wd_fired = 0;
@@ -143,21 +144,53 @@ static int next_frame(void)
     return 1;
 }
 
-static uint8_t to_u8(int v)
+static int to_s16(int v)
 {
     v = (v * vol) >> 4;
-    v = (v + 128) >> 8;
-    if (v > 127) v = 127;
-    if (v < -128) v = -128;
-    return (uint8_t)(v + 128);
+    return v > 32767 ? 32767 : v < LOW ? LOW : v;
+}
+
+/* Блок кольца из кадров (16 бит со знаком): кадр 0 -- сдвиги s левого и
+ * правого, дальше FRAMES отсчётов q по 8 бит (80h -- середина), значение
+ * отсчёта -- q * 2^(8-s). Сдвиг -- наибольший 0..PCM_SHIFT_MAX, при котором
+ * пик канала в блоке влезает в 8 бит: тихий блок идёт с точностью до 12 бит,
+ * громкий -- как раньше, 8 (13.11.2026: шум квантования на тихой музыке). */
+static void encode(const int16_t *fr, uint8_t *blk)
+{
+    int c, k;
+    for (c = 0; c < 2; c++) {
+        int pk = 0, s = 0, sh;
+        for (k = 0; k < FRAMES; k++) {
+            int a = fr[2 * k + c];
+            if (a < 0) a = -a;
+            if (a > pk) pk = a;
+        }
+        while (s < PCM_SHIFT_MAX && (pk << (s + 1)) < 32768 - 256) s++;
+        sh = 8 - s;
+        blk[c] = (uint8_t)s;
+        for (k = 0; k < FRAMES; k++) {
+            int q = (fr[2 * k + c] + (1 << (sh - 1))) >> sh;
+            if (q > 127) q = 127;
+            if (q < -128) q = -128;
+            blk[2 + 2 * k + c] = (uint8_t)(q + 128);
+        }
+    }
+}
+
+static void decode(const uint8_t *blk, int16_t *fr)
+{
+    int c, k;
+    for (c = 0; c < 2; c++)
+        for (k = 0; k < FRAMES; k++)
+            fr[2 * k + c] = (int16_t)((blk[2 + 2 * k + c] - 128) * (1 << (8 - (blk[c] & 7))));
 }
 
 /* Один кадр музыки. 0 -- выдавать нечего (done). В режиме игры без музыки --
  * середина (80h): выход не стоит, эффекту есть на чём звучать. */
-static int out_frame(uint8_t *l, uint8_t *r)
+static int out_frame(int *l, int *r)
 {
     if (ramp_in) {
-        *l = *r = last_l = last_r = (uint8_t)(0x80 - (0x80 * ramp_in) / RAMP);
+        *l = *r = last_l = last_r = (LOW * ramp_in) / RAMP;
         ramp_in--;
         return 1;
     }
@@ -171,34 +204,36 @@ static int out_frame(uint8_t *l, uint8_t *r)
             frac -= 0x10000;
             if (!k) { src_close(); ramp_out = RAMP; break; }
         }
-        *l = last_l = to_u8(vl); *r = last_r = to_u8(vr);
+        *l = last_l = to_s16(vl); *r = last_r = to_s16(vr);
         return 1;
     }
     if (ramp_out) {
         /* к нулю, а в режиме игры -- к середине: выход живёт дальше */
-        int t = gm ? 0x80 : 0;
-        *l = (uint8_t)(t + ((last_l - t) * (ramp_out - 1)) / RAMP);
-        *r = (uint8_t)(t + ((last_r - t) * (ramp_out - 1)) / RAMP);
+        int t = gm ? 0 : LOW;
+        *l = t + (int)(((long)(last_l - t) * (ramp_out - 1)) / RAMP);
+        *r = t + (int)(((long)(last_r - t) * (ramp_out - 1)) / RAMP);
         if (--ramp_out == 0) {
-            if (gm) last_l = last_r = 0x80;
+            if (gm) last_l = last_r = 0;
             else done = 1;
         }
         return 1;
     }
-    if (gm) { *l = *r = 0x80; return 1; }
+    if (gm) { *l = *r = 0; return 1; }
     return 0;
 }
 
-/* Блок музыки; 0 -- нечего класть. Хвост последнего блока -- нули. */
+/* Блок музыки; 0 -- нечего класть. Хвост последнего блока -- низ шкалы. */
 static int make_block(uint8_t *blk)
 {
+    static int16_t fr[2 * FRAMES];
     int k;
     if (done) return 0;
     for (k = 0; k < FRAMES; k++) {
-        uint8_t l = 0, r = 0;
-        if (done || !out_frame(&l, &r)) l = r = 0;
-        blk[2 * k] = l; blk[2 * k + 1] = r;
+        int l = LOW, r = LOW;
+        if (done || !out_frame(&l, &r)) l = r = LOW;
+        fr[2 * k] = (int16_t)l; fr[2 * k + 1] = (int16_t)r;
     }
+    encode(fr, blk);
     return 1;
 }
 
@@ -242,28 +277,24 @@ static int soft(int x)
     return x < 0 ? -a : a;
 }
 
-static uint8_t mix8(uint8_t m, int e)
-{
-    int v = soft(((m - 128) << 8) + e);
-    v = (v + 128) >> 8;
-    if (v > 127) v = 127;
-    if (v < -128) v = -128;
-    return (uint8_t)(v + 128);
-}
-
-/* Эффекты в блок abs поверх музыки (blk -- музыка без эффекта). */
+/* Эффекты в блок abs поверх музыки (blk -- музыка без эффекта): блок
+ * раскрывается в 16 бит, сводится и кодируется заново -- сдвиг блока может
+ * стать меньше, если эффект громче музыки. */
 static void fx_mix(long abs, uint8_t *blk)
 {
+    static int16_t fr[2 * FRAMES];
     long long f0 = (long long)abs * FRAMES, e0 = fx_end(&fx), e1 = fx_end(&fx_old);
     int k;
     if ((!fx.k || e0 <= f0 || fx.start >= f0 + FRAMES) && (!fx_old.k || e1 <= f0 || fx_old.start >= f0 + FRAMES))
         return;
+    decode(blk, fr);
     for (k = 0; k < FRAMES; k++) {
         int e = fx_at(&fx, f0 + k) + fx_at(&fx_old, f0 + k);
         if (!e) continue;
-        blk[2 * k] = mix8(blk[2 * k], e);
-        blk[2 * k + 1] = mix8(blk[2 * k + 1], e);
+        fr[2 * k] = (int16_t)soft(fr[2 * k] + e);
+        fr[2 * k + 1] = (int16_t)soft(fr[2 * k + 1] + e);
     }
+    encode(fr, blk);
 }
 
 /* Блоки [from, wabs) -- заново: музыка из mir плюс эффекты. Блок, которого нет
@@ -363,7 +394,7 @@ static void stop_music(void)
     if (st == S_IDLE) { err = 0; return; }
     src_close();
     if (st == S_START) { st = S_IDLE; run = 0; done = 1; return; }
-    ramp_in = 0; ramp_out = RAMP; last_l = last_r = 0x80; done = 0;
+    ramp_in = 0; ramp_out = RAMP; last_l = last_r = 0; done = 0;
     wabs = wabs - ((wblk - rp) & (PCM_NBLK - 1)) + 1;
     wblk = (rp + 1) & (PCM_NBLK - 1);
     st = S_PLAY;
@@ -449,14 +480,14 @@ static void game(int on)
     gm = 0;
     if (!src_on && st != S_IDLE) {      /* без музыки -- от середины к нулю */
         if (ramp_in) {                  /* ещё не дошли до середины */
-            last_l = last_r = (uint8_t)(0x80 - (0x80 * ramp_in) / RAMP);
+            last_l = last_r = (LOW * ramp_in) / RAMP;
             ramp_in = 0;
         }
         else if (ramp_out) {            /* гасла к середине: оттуда, где сейчас */
-            last_l = (uint8_t)(0x80 + ((last_l - 0x80) * ramp_out) / RAMP);
-            last_r = (uint8_t)(0x80 + ((last_r - 0x80) * ramp_out) / RAMP);
+            last_l = (int)(((long)last_l * ramp_out) / RAMP);
+            last_r = (int)(((long)last_r * ramp_out) / RAMP);
         }
-        else last_l = last_r = 0x80;
+        else last_l = last_r = 0;
         ramp_out = RAMP;
     }
 }
