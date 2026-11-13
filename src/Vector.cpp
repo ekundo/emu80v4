@@ -1472,6 +1472,9 @@ static int pcmMemRead(void*, uint16_t a, uint8_t* dst, int n)
 VectorPcm::VectorPcm()
 {
     m_snd = new VectorPcmSoundSource;
+    // полная шкала PCM -- как канал AY A (1,5 шкалы источника): веса смесителя
+    // платы, hdl/audio.v; таймер и PC0 -- 19 в vector.conf
+    m_snd->setVolume(75);
 #ifdef VECTOR_PCM
     s_pcm = this;
 #endif
