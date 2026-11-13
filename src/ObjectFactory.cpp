@@ -242,6 +242,7 @@ ObjectFactory::ObjectFactory()
     REG_EMU_CLASS(VectorColorRegister);
     REG_EMU_CLASS(VectorMouse);
     REG_EMU_CLASS(VectorModem);
+    REG_EMU_CLASS(VectorPcm);
     REG_EMU_CLASS(VectorKeyboard);
     REG_EMU_CLASS(VectorContention);
     REG_EMU_CLASS(VectorKbdLayout);

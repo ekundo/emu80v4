@@ -298,6 +298,23 @@ HEADERS += \
         combolite/netcompat.h \
         combolite/vchan.h
 
+# Проигрыватель PCM платы ComboLite rev5 (VectorPcm): код ESP платы, копией в combolite/, и
+# декодеры MP3 (minimp3) и MOD (micromod); ПЛИС и задача ESP -- модель в combolite/pcm_host.c.
+DEFINES += VECTOR_PCM
+SOURCES += \
+        combolite/pcm_host.c \
+        combolite/pcm_play.c \
+        combolite/pcm_src.c \
+        combolite/pcm_mp3.c \
+        combolite/pcm_mod.c \
+        combolite/vendor/micromod/micromod.c
+HEADERS += \
+        combolite/pcm_host.h \
+        combolite/pcm_play.h \
+        combolite/pcm_src.h \
+        combolite/vendor/micromod/micromod.h \
+        combolite/vendor/minimp3/minimp3.h
+
 BUILDDIR = build
 OBJECTS_DIR = $${BUILDDIR}/obj
 MOC_DIR = $${BUILDDIR}/moc

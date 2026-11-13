@@ -1,6 +1,7 @@
 #!/bin/sh
 # Взять код ESP платы ComboLite в эмулятор: Wi-Fi модем и канал настроек
-# работают здесь те же, что на плате (VectorModem в src/Vector.cpp).
+# работают здесь те же, что на плате (VectorModem в src/Vector.cpp); проигрыватель
+# PCM rev5 -- тоже (VectorPcm).
 #
 #   src/combolite/sync.sh ~/src/v06c-combolite/fw
 #
@@ -14,4 +15,15 @@ for f in vchan.c vchan.h modem.c modem.h bbslist.c bbslist.h \
     cp "$FW/$f" "$HERE/$f"
 done
 git -C "$FW" log -1 --format='%H' > "$HERE/FW_VERSION" 2>/dev/null || true
+# проигрыватель PCM (VectorPcm) -- есть только в fw rev5 и новее; иначе остаётся прежний.
+# pcm_host.c и pcm_host.h -- не отсюда: это модель ПЛИС и задачи ESP, свои у эмулятора
+if [ -f "$FW/pcm_play.c" ]; then
+    for f in pcm_play.c pcm_play.h pcm_src.c pcm_src.h pcm_mp3.c pcm_mod.c; do
+        cp "$FW/$f" "$HERE/$f"
+    done
+    mkdir -p "$HERE/vendor/minimp3" "$HERE/vendor/micromod"
+    cp "$FW/vendor/minimp3/minimp3.h" "$FW/vendor/minimp3/LICENSE" "$HERE/vendor/minimp3/"
+    cp "$FW/vendor/micromod/micromod.c" "$FW/vendor/micromod/micromod.h" "$FW/vendor/micromod/licence.txt" "$HERE/vendor/micromod/"
+    git -C "$FW" log -1 --format='%H' > "$HERE/PCM_VERSION" 2>/dev/null || true
+fi
 echo "взято из $FW"

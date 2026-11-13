@@ -1447,3 +1447,155 @@ void VectorModem::writeByte(int addr, uint8_t value)
     (void)value;
 #endif
 }
+
+
+// ---------------------------------------------------------------- проигрыватель PCM ComboLite
+
+#ifdef VECTOR_PCM
+#include "combolite/pcm_host.h"
+
+// Код ESP один на процесс: откуда брать ОЗУ для длинных команд.
+static VectorPcm* s_pcm = nullptr;
+
+static int pcmMemRead(void*, uint16_t a, uint8_t* dst, int n)
+{
+    AddressableDevice* ram = s_pcm ? s_pcm->ram() : nullptr;
+    if (!ram)
+        return -1;
+    for (int i = 0; i < n; i++)
+        dst[i] = ram->readByte(uint16_t(a + i));
+    return 0;
+}
+#endif
+
+
+VectorPcm::VectorPcm()
+{
+    m_snd = new VectorPcmSoundSource;
+#ifdef VECTOR_PCM
+    s_pcm = this;
+#endif
+}
+
+
+VectorPcm::~VectorPcm()
+{
+#ifdef VECTOR_PCM
+    if (s_pcm == this)
+        s_pcm = nullptr;
+#endif
+    delete m_snd;
+}
+
+
+bool VectorPcm::setProperty(const std::string& propertyName, const EmuValuesList& values)
+{
+    if (AddressableDevice::setProperty(propertyName, values))
+        return true;
+
+    if (propertyName == "ram") {
+        m_ram = static_cast<AddressableDevice*>(g_emulation->findObject(values[0].asString()));
+        return true;
+    } else if (propertyName == "musicDir") {
+        m_musicDir = values[0].asString();
+        return true;
+    }
+    return false;
+}
+
+
+// Папка дорожек: musicDir из конфига, иначе $COMBOLITE_MUSIC, иначе ~/Music/ComboLite.
+void VectorPcm::start()
+{
+    m_started = true;
+#ifdef VECTOR_PCM
+    std::string dir = m_musicDir;
+    if (dir.empty()) {
+        const char* env = getenv("COMBOLITE_MUSIC");
+        const char* home = getenv("HOME");
+        if (env && *env)
+            dir = env;
+        else if (home)
+            dir = std::string(home) + "/Music/ComboLite";
+    } else if (dir[0] == '~') {
+        const char* home = getenv("HOME");
+        dir = std::string(home ? home : "") + dir.substr(1);
+    }
+    pcm_host_init(dir.c_str(), pcmMemRead, nullptr);
+#endif
+}
+
+
+// Отсчёт 44 092 раза в секунду времени «Вектора» (такт ПЛИС), заодно -- опрос ESP.
+void VectorPcm::operate()
+{
+    if (!m_started)
+        start();
+#ifdef VECTOR_PCM
+    int16_t l, r;
+    pcm_host_step(&l, &r);
+    m_snd->setValue(l, r);
+#endif
+    m_frac += g_emulation->getFrequency();
+    m_curClock += m_frac / 44092;
+    m_frac %= 44092;
+}
+
+
+uint8_t VectorPcm::readByte(int)
+{
+#ifdef VECTOR_PCM
+    if (!m_started)
+        start();
+    return pcm_host_in();
+#else
+    return 0xFF;
+#endif
+}
+
+
+void VectorPcm::writeByte(int, uint8_t value)
+{
+#ifdef VECTOR_PCM
+    if (!m_started)
+        start();
+    pcm_host_out(value);
+#else
+    (void)value;
+#endif
+}
+
+
+// Как Covox: значение за время между отсчётами микшера -- среднее по тактам.
+void VectorPcmSoundSource::updateStats()
+{
+    uint64_t curClock = g_emulation->getCurClock();
+    int64_t clocks = curClock - m_prevClock;
+    m_sumL += clocks * m_l;
+    m_sumR += clocks * m_r;
+    m_prevClock = curClock;
+}
+
+
+void VectorPcmSoundSource::setValue(int l, int r)
+{
+    updateStats();
+    m_l = l;
+    m_r = r;
+}
+
+
+StereoSample VectorPcmSoundSource::getSample()
+{
+    updateStats();
+    StereoSample res = {0, 0};
+    uint64_t ticks = g_emulation->getCurClock() - m_initClock;
+    if (ticks) {
+        // полная шкала PCM (+-32767) -- полная шкала источника (MAX_SND_AMP)
+        res.left = int(m_sumL * MAX_SND_AMP / 32768 / int64_t(ticks)) * m_ampFactor / 100;
+        res.right = int(m_sumR * MAX_SND_AMP / 32768 / int64_t(ticks)) * m_ampFactor / 100;
+    }
+    m_sumL = m_sumR = 0;
+    m_initClock = g_emulation->getCurClock();
+    return res;
+}

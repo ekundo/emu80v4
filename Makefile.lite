@@ -25,7 +25,9 @@ OBJECTS := $(patsubst $(SRC_DIR)/%.cpp,$(OBJ_DIR)/%.o,$(SOURCES))
 
 # Wi-Fi модем платы ComboLite (VectorModem): код ESP платы на C, копией в src/combolite/
 EMU_CXXFLAGS += -DVECTOR_MODEM
-CSOURCES := $(wildcard $(SRC_DIR)/combolite/*.c)
+# и проигрыватель PCM rev5 (VectorPcm): код ESP платы, декодеры MP3 (minimp3) и MOD (micromod)
+EMU_CXXFLAGS += -DVECTOR_PCM
+CSOURCES := $(wildcard $(SRC_DIR)/combolite/*.c) $(SRC_DIR)/combolite/vendor/micromod/micromod.c
 OBJECTS += $(patsubst $(SRC_DIR)/%.c,$(OBJ_DIR)/%.o,$(CSOURCES))
 DEPENDS := $(OBJECTS:.o=.d)
 

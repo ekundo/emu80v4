@@ -27,6 +27,7 @@
 #include "KbdLayout.h"
 #include "CpuWaits.h"
 #include "MouseDevice.h"
+#include "SoundMixer.h"
 
 class Ram;
 class Rom;
@@ -457,6 +458,57 @@ class VectorModem : public AddressableDevice, public IActive
         VectorRamDiskSelector* m_ramDiskSelector = nullptr;
 
         void poll();
+};
+
+
+// Проигрыватель PCM платы ComboLite rev5: почтовый порт 3Ch (протокол -- src/combolite/pcm_play.h),
+// звук 44 092 Гц, 8 бит, стерео -- поверх AY. Код ESP -- тот же, что на плате (pcm_play.c и
+// декодеры WAV, MP3, MOD, копией через sync.sh), ПЛИС и задача ESP -- модель в pcm_host.c.
+// Дорожка N -- N-й по алфавиту файл папки musicDir (на плате -- music на карте); ячейки (длинные
+// команды) игра грузит из ОЗУ -- это ram. Без PCM в сборке порт читается как FFh: проигрывателя нет.
+// Сброс «Вектора» проигрыватель не трогает: на плате ПЛИС сбрасывается только по питанию.
+class VectorPcmSoundSource;
+
+class VectorPcm : public AddressableDevice, public IActive
+{
+    public:
+        VectorPcm();
+        ~VectorPcm();
+
+        bool setProperty(const std::string& propertyName, const EmuValuesList& values) override;
+
+        void writeByte(int addr, uint8_t value) override;
+        uint8_t readByte(int addr) override;
+
+        void operate() override;
+
+        AddressableDevice* ram() {return m_ram;}
+
+        static EmuObject* create(const EmuValuesList&) {return new VectorPcm();}
+
+    private:
+        AddressableDevice* m_ram = nullptr;
+        VectorPcmSoundSource* m_snd = nullptr;
+        std::string m_musicDir;
+        bool m_started = false;
+        uint64_t m_frac = 0;
+
+        void start();
+};
+
+
+class VectorPcmSoundSource : public SoundSource
+{
+    public:
+        int calcValue() override {return 0;}
+        StereoSample getSample() override;
+        void setValue(int l, int r);
+
+    private:
+        int m_l = 0, m_r = 0;
+        int64_t m_sumL = 0, m_sumR = 0;
+        uint64_t m_initClock = 0, m_prevClock = 0;
+        void updateStats();
 };
 
 
