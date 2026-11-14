@@ -107,7 +107,9 @@
  * музыке. */
 #define PCM_NBLK      512               /* блоков в кольце */
 #define PCM_AHEAD     480               /* сколько блоков держать впереди */
+#ifndef PCM_GAME_AHEAD                  /* rev4: 20 (CMakeLists.txt) -- шаг ESP бывает до 36 мс */
 #define PCM_GAME_AHEAD 8                /* то же в режиме игры, 46 мс */
+#endif
 #define PCM_FX_LEAD   2                 /* эффект -- с блока rp + 2: 6-12 мс */
 
 #define PCM_ST_PLAY   0x02
@@ -202,6 +204,10 @@ void pcm_kick(void);
 void pcm_debug_slot_play(int k, FILE *f, long len);
 /* Сколько обменов дали указатель ПЛИС впереди записанного (отброшены). */
 unsigned long pcm_rp_bad(void);
+void pcm_debug2(unsigned long v[10]);  /* кик, эффект, стоп, длинная, прочее, перезаписей, опоздавших, наименьший запас, наибольший промежуток пинков (мс), сбросов */
+void pcm_machine_reset(void);
+const char *pcm_wd_report(void);        /* строка о последнем срабатывании сторожа (одна выдача), иначе 0 */
+void pcm_debug3(long long v[6], unsigned long *n, unsigned long *bytes);   /* загрузка ячеек: от 80h до разбора, разбор, файл, пауза; команд, байт */           /* сброс «Вектора»: музыку и режим игры -- сразу */
 /* Наименьший срок сторожа, десятые секунды: 0Bh меньше не ставит. rev4 --
  * 30 (CMakeLists.txt): на плате №1 сторож гасил музыку посреди уровня при
  * сроке игры 1 с (14.11.2026), причина не найдена. */

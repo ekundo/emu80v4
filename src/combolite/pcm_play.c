@@ -1,5 +1,25 @@
 /* Проигрыватель PCM rev5 -- без платы (pcm_play.h). */
 #include "pcm_play.h"
+#ifdef ESP_PLATFORM
+#include "esp_timer.h"
+#define NOW_US() esp_timer_get_time()
+#else
+#define NOW_US() 0LL
+#endif
+static long long z_t80 = -1, z_end = -1, z_mail, z_exe, z_fl, z_gap;
+static unsigned long z_n, z_bytes;
+/* Срабатывание сторожа -- в журнал (14.11.2026, владелец: срок 0,5 с,
+ * «ловишь, где таймаут, порт чинит»): последние байты почты с временем,
+ * последняя длинная команда, что звучало. */
+#define WD_LOG 12
+static uint8_t  wl_b[WD_LOG];
+static long long wl_t[WD_LOG];
+static int      wl_i;
+static uint8_t  wl_op = 0xFF;
+static long long wl_op_t;
+static char     wd_txt[400];
+static int      wd_new;
+static long long wd_prev_us, wd_acc_us;    /* сторож: время, пока звучит */
 
 #include <stdlib.h>
 #include <string.h>
@@ -8,7 +28,21 @@
 #define INBUF 2304                      /* отсчётов источника за раз (кадр MP3 стерео) */
 #define FRAMES PCM_FRAMES               /* кадров в блоке кольца (первый -- сдвиги) */
 #define LOW   (-32768)                  /* низ шкалы: выход «в ноль» */
-#define MIR   16                        /* блоков музыки без эффекта: больше PCM_GAME_AHEAD */
+/* Покой выхода PCM. Прежний смеситель (rev4-fb-70 и раньше, rev5-39) считал
+ * отсчёт без знака: покой -- низ шкалы, и вход в работу и выход из неё --
+ * плавные 11,6 мс от низа к середине. На плате №1 с весом x4 это щелчок при
+ * включении режима игры (14.11.2026). Смеситель mixer.v (rev4-fb-71) берёт
+ * отсчёт со знаком вокруг 80h, и pcm.v после включения стоит на 80h: покой --
+ * середина, перепада нет (PCM_REST_MID, CMakeLists.txt). */
+#ifdef PCM_REST_MID
+#define REST  0
+#else
+#define REST  LOW
+#endif
+#ifndef PCM_MIR
+#define PCM_MIR (PCM_GAME_AHEAD + 8)
+#endif
+#define MIR   PCM_MIR                   /* блоков музыки без эффекта: больше PCM_GAME_AHEAD */
 #define FX_EDGE 32                      /* кадров плавного края эффекта, 0,7 мс */
 
 enum { S_IDLE, S_START, S_PLAY, S_DRAIN };
@@ -75,7 +109,13 @@ static voice_t   fx, fx_old;
  * всегда. После срабатывания короткая почта не значит ничего (иначе эффект N
  * от ожившей игры пустил бы дорожку N с карты), пока не придёт 07h. FFh
  * вне режима игры -- тоже ничего: загрузчик пинает и до 07h. */
-#define WD_DEFAULT 20                   /* 2 с */
+/* Срок сторожа по умолчанию, десятые секунды. rev4: 5 (CMakeLists.txt) --
+ * владелец 14.11.2026: «3 секунды не устраивают, не больше 1, лучше
+ * половину». Сброс машины гасит музыку и без сторожа (pcm_machine_reset). */
+#ifndef PCM_WD_DEFAULT
+#define PCM_WD_DEFAULT 20
+#endif
+#define WD_DEFAULT PCM_WD_DEFAULT
 static int       wd_t = WD_DEFAULT, wd_dead;
 static int       wd_kick;               /* пинок пришёл, отметку ещё не взяли */
 static long long wd_last;
@@ -92,10 +132,10 @@ void pcm_init(const pcm_ops_t *o)
     src_on = 0;
     ops = *o;
     st = S_IDLE; run = 0; err = 0; ready = 1; wblk = 0; wabs = 0; rp = 0;
-    src_on = 0; done = 1; last_l = last_r = LOW;
+    src_on = 0; done = 1; last_l = last_r = REST;
     ext_n = 0; playing_slot = 0;
     gm = 0; fx_n = 0; fx.k = fx_old.k = 0; fx_vol = 16;
-    wd_t = WD_DEFAULT; wd_dead = 0; wd_kick = 0; wd_last = 0; wd_fired = 0;
+    wd_t = WD_DEFAULT; wd_dead = 0; wd_kick = 0; wd_last = 0; wd_fired = 0; wd_prev_us = 0; wd_acc_us = 0;
     under = 0; starved = 0;
     for (k = 0; k < MIR; k++) mir_abs[k] = -1;
 }
@@ -150,6 +190,26 @@ unsigned long pcm_watchdog_fired(void) { return wd_fired; }
 static unsigned long xc_miss, rp_bad;
 unsigned long pcm_xmem_misses(void) { return xc_miss; }
 unsigned long pcm_rp_bad(void) { return rp_bad; }
+
+/* Отладка заикания режима игры (14.11.2026): почта по видам, перезаписи
+ * блоков и опоздавшие из них -- ПЛИС вошла в блок rw_first раньше, чем ESP
+ * его переписала. */
+static unsigned long d_kick, d_fx, d_stop, d_ext, d_other, d_rw, d_rw_late, d_ahead = 999, d_kgap, d_resets;
+static long rw_first = -1;
+/* v[7] -- наименьший запас кольца (блоков) на обмене с ПЛИС, пока играет
+ * музыка; с прошлого вызова. 1 -- ПЛИС на последнем записанном блоке: на
+ * границе она держит отсчёт, а rp остаётся на этом блоке, поэтому rp == wblk
+ * (недобор) так не увидеть. */
+/* v[8] -- самый длинный промежуток между пинками в режиме игры с прошлого
+ * вызова, мс (по выходу ПЛИС, с точностью до блока 5,8 мс); v[9] -- сбросов
+ * машины, погасивших музыку. */
+void pcm_debug2(unsigned long v[10])
+{
+    v[0] = d_kick; v[1] = d_fx; v[2] = d_stop; v[3] = d_ext; v[4] = d_other; v[5] = d_rw; v[6] = d_rw_late;
+    v[7] = d_ahead; d_ahead = 999;
+    v[8] = d_kgap; d_kgap = 0;
+    v[9] = d_resets;
+}
 void pcm_debug(int *rp_, int *wblk_, int *st_, int *gm_, int *src_)
 {
     *rp_ = rp; *wblk_ = wblk; *st_ = st; *gm_ = gm; *src_ = src_on;
@@ -229,7 +289,7 @@ static void decode(const uint8_t *blk, int16_t *fr)
 static int out_frame(int *l, int *r)
 {
     if (ramp_in) {
-        *l = *r = last_l = last_r = (LOW * ramp_in) / RAMP;
+        *l = *r = last_l = last_r = (REST * ramp_in) / RAMP;
         ramp_in--;
         return 1;
     }
@@ -248,7 +308,7 @@ static int out_frame(int *l, int *r)
     }
     if (ramp_out) {
         /* к нулю, а в режиме игры -- к середине: выход живёт дальше */
-        int t = gm ? 0 : LOW;
+        int t = gm ? 0 : REST;
         *l = t + (int)(((long)(last_l - t) * (ramp_out - 1)) / RAMP);
         *r = t + (int)(((long)(last_r - t) * (ramp_out - 1)) / RAMP);
         if (--ramp_out == 0) {
@@ -268,8 +328,8 @@ static int make_block(uint8_t *blk)
     int k;
     if (done) return 0;
     for (k = 0; k < FRAMES; k++) {
-        int l = LOW, r = LOW;
-        if (done || !out_frame(&l, &r)) l = r = LOW;
+        int l = REST, r = REST;
+        if (done || !out_frame(&l, &r)) l = r = REST;
         fr[2 * k] = (int16_t)l; fr[2 * k + 1] = (int16_t)r;
     }
     encode(fr, blk);
@@ -406,6 +466,7 @@ static void fx_switch(int k, int reps, unsigned rate)
 {
     long first = fx_first();
     long long cut = (long long)first * FRAMES;
+    d_rw++; rw_first = first;
     fx_old = fx;
     if (fx_old.k && (fx_old.cut < 0 || fx_old.cut > cut)) fx_old.cut = cut;
     fx.k = k; fx.reps = reps; fx.cut = -1; fx.start = cut;
@@ -505,6 +566,7 @@ static void stop_music(void)
 void pcm_command(int cmd)
 {
     cmd &= 0xFF;
+    wl_b[wl_i] = (uint8_t)cmd; wl_t[wl_i] = NOW_US(); wl_i = (wl_i + 1) % WD_LOG;
     if (gm) wd_kick = 1;                    /* любая почта -- пинок */
     if (ext_n) {
         /* байт адреса блока параметров длинной команды: младший, старший */
@@ -513,7 +575,15 @@ void pcm_command(int cmd)
         if (--ext_n == 0) ext_command();
         return;
     }
-    if (cmd == 0x80) { ext_n = 2; hurry = 200; return; }
+    if (cmd == 0x80) {
+        long long t = NOW_US();
+        if (z_end >= 0) z_gap += t - z_end;
+        z_t80 = t; ext_n = 2; hurry = 200; d_ext++; return;
+    }
+    if (cmd == 0xFF) d_kick++;
+    else if (cmd == 0x00) d_stop++;
+    else if (cmd < 0x80) d_fx++;
+    else d_other++;
     if (gm) {
         if (cmd == 0x00) { err = 0; if (fx.k) fx_switch(0, 0, 0); }
         else if (cmd < 0x80) fx_play(cmd);
@@ -580,7 +650,7 @@ static void game(int on)
     gm = 0;
     if (!src_on && st != S_IDLE) {      /* без музыки -- от середины к нулю */
         if (ramp_in) {                  /* ещё не дошли до середины */
-            last_l = last_r = (LOW * ramp_in) / RAMP;
+            last_l = last_r = (REST * ramp_in) / RAMP;
             ramp_in = 0;
         }
         else if (ramp_out) {            /* гасла к середине: оттуда, где сейчас */
@@ -703,7 +773,23 @@ static int stage_same(int k, int n)
     return 1;
 }
 
+static int stage_flush_do(void);
+/* Замер загрузки ячеек (14.11.2026, форк сессии: темы Gobliiins грузятся
+ * ~4 КБ/с): мкс от 80h до разбора, разбор целиком, сверка/запись файла,
+ * пауза «Вектора» между командами; байт дописано. */
+void pcm_debug3(long long v[6], unsigned long *n, unsigned long *bytes)
+{
+    v[0] = z_mail; v[1] = z_exe; v[2] = z_fl; v[3] = z_gap; *n = z_n; *bytes = z_bytes;
+    z_mail = z_exe = z_fl = z_gap = 0; z_n = z_bytes = 0;
+}
 static int stage_flush(void)
+{
+    long long t = NOW_US();
+    int rc = stage_flush_do();
+    z_fl += NOW_US() - t;
+    return rc;
+}
+static int stage_flush_do(void)
 {
     int k = fst_k, n = fst_n;
     fst_n = 0;
@@ -772,6 +858,7 @@ static int slot_to_file(int k)
 
 static int slot_append(int k, uint16_t a, uint16_t n)
 {
+    z_bytes += n;
     long need = slot[k].len + n;
     if ((long)a + n > 0x10000L) return -1;
     if (!slot[k].f && !slot[k].xm && ops.slot_file && need >= PCM_FILE_MIN && slot_to_file(k) < 0) return -1;
@@ -819,11 +906,20 @@ static int fx_table(int n, uint16_t a)
 }
 
 /* Блок параметров -- в ОЗУ «Вектора» по ext_a (зеркало в статике). */
+static void ext_command_do(void);
 static void ext_command(void)
+{
+    long long t = NOW_US();
+    if (z_t80 >= 0) z_mail += t - z_t80;
+    ext_command_do();
+    z_end = NOW_US(); z_exe += z_end - t; z_n++;
+}
+static void ext_command_do(void)
 {
     uint8_t b[6];
     int ok = 0, k;
     if (ops.mem_read(ops.ctx, ext_a, b, sizeof b) == 0) {
+        wl_op = b[0]; wl_op_t = NOW_US();
         k = b[1];
         switch (b[0]) {
         case PCM_OP_BEGIN:
@@ -892,6 +988,60 @@ void pcm_debug_slot_play(int k, FILE *f, long len)
     if (src_on) playing_slot = k;
 }
 
+/* Сброс машины (rev4: флаг сброса эмулятора винта, pcm4.c): музыку и
+ * эффект -- сразу, не дожидаясь сторожа; режим игры -- выключить, как
+ * сработавший сторож (короткая почта ничего не значит до 07h). */
+/* Часы сторожа: на ESP -- настоящие; в эмуляторах (модель ПЛИС, pcm_host.c)
+ * -- по выходу ПЛИС, приращение за шаг не больше 50 мс (см. pcm_tick). */
+static long long wd_clock_us(void)
+{
+#ifdef ESP_PLATFORM
+    return NOW_US();
+#else
+    return play_frame() * 1000000LL / PCM_RATE;
+#endif
+}
+
+static void wd_note(long ms)
+{
+    long long tn = NOW_US();
+    int i, n;
+    n = snprintf(wd_txt, sizeof wd_txt,
+                 "watchdog: no kick for %ld ms (limit %d00 ms); music %s, effect %s; mail (newest first):",
+                 ms, wd_t > PCM_WD_MIN ? wd_t : PCM_WD_MIN, src_on ? "on" : "off", fx.k ? "on" : "off");
+    for (i = 1; i <= WD_LOG && n < (int)sizeof wd_txt - 16; i++) {
+        int j = (wl_i - i + WD_LOG) % WD_LOG;
+        if (!wl_t[j]) break;
+        n += snprintf(wd_txt + n, sizeof wd_txt - (size_t)n, " %02X@-%ld", wl_b[j], (long)((tn - wl_t[j]) / 1000));
+    }
+    if (n < (int)sizeof wd_txt - 40)
+        snprintf(wd_txt + n, sizeof wd_txt - (size_t)n, "; last long op %02X %ld ms ago",
+                 wl_op, wl_op_t ? (long)((tn - wl_op_t) / 1000) : -1L);
+    wd_new = 1;
+}
+
+const char *pcm_wd_report(void)
+{
+    if (!wd_new) return 0;
+    wd_new = 0;
+    return wd_txt;
+}
+
+void pcm_machine_reset(void)
+{
+    int was = gm || st != S_IDLE;
+    if (gm) {
+        music_off();
+        game(0);
+        wd_dead = 1;
+    }
+    /* и отвести границу кольца к rp + 1: в режиме игры впереди записано до
+     * PCM_GAME_AHEAD блоков (rev4 -- 116 мс), без этого они доигрывали бы
+     * после сброса (плата №1 14.11.2026: тишина через 0,4-0,7 с) */
+    stop_music();
+    if (was) d_resets++;
+}
+
 /* Признак жизни «Вектора» со стороны (rev4: команда винта, pcm4.c). */
 void pcm_kick(void)
 {
@@ -915,6 +1065,12 @@ int pcm_tick(int max)
          * указатель отбрасывался на каждом обмене, кольцо не доливалось) */
         if (gm && ((wblk - nrp) & (PCM_NBLK - 1)) > PCM_AHEAD && st != S_START) rp_bad++;
         else rp = nrp;
+        if (st == S_PLAY && src_on && (unsigned long)((wblk - rp) & (PCM_NBLK - 1)) < d_ahead)
+            d_ahead = (unsigned long)((wblk - rp) & (PCM_NBLK - 1));
+        if (rw_first >= 0) {
+            if (wabs - ((wblk - rp) & (PCM_NBLK - 1)) > rw_first) d_rw_late++;
+            rw_first = -1;
+        }
     }
     if (st == S_START && !run) {
         /* ПЛИС только что получила run = 0 -- указатель в начале */
@@ -934,19 +1090,34 @@ int pcm_tick(int max)
     }
     else if (st == S_DRAIN && rp == wblk) { st = S_IDLE; run = 0; }
     if (mail >= 0) { pcm_command(mail); if (!gm) hurry = 200; }
-    /* Отметку берём, только пока выход идёт: при перезапуске кольца (S_START)
-     * play_frame -- мусор. Пинок до того -- отметка с первого шага выхода. */
-    if (gm && (st == S_PLAY || st == S_DRAIN)) {
-        long long now = play_frame();
-        /* пинок -- и почта, и исполненная длинная команда (игра ждала её
-         * ответа), и команда винта (pcm_kick из pcm4.c): на медленной записи
-         * карты rev4 сторож гасил музыку интро Gobliiins (14.11.2026) */
-        if (wd_kick || now < wd_last) { wd_last = now; wd_kick = 0; }
-        else if (!ext_n && now - wd_last > (long long)(wd_t > PCM_WD_MIN ? wd_t : PCM_WD_MIN) * PCM_RATE / 10) {
-            music_off();
-            game(0);
-            wd_dead = 1;
-            wd_fired++;
+    /* СТОРОЖ ПО ЧАСАМ ESP (14.11.2026). Прежде время шло по позиции выхода
+     * ПЛИС (play_frame: wabs - (wblk - rp)), а она прыгает, когда граница
+     * кольца отводится назад: на плате №1 сторож насчитал 1,48 с без пинка
+     * при пинках каждые 20 мс. Теперь время копится по часам, только пока в
+     * режиме игры что-то звучит (музыка, её затухание или эффект), и
+     * обнуляется пинком. Почта разобрана выше, до проверки: пинок, пришедший
+     * за долгий шаг задачи, лежит в ящике ПЛИС и успевает. */
+    {
+        long long t = wd_clock_us();
+        long long dt = wd_prev_us ? t - wd_prev_us : 0;
+        if (dt < 0 || dt > 50000) dt = dt < 0 ? 0 : 50000;   /* модель: позиция выхода прыгает */
+        int sounding = (st == S_PLAY || st == S_DRAIN) && (src_on || ramp_out || fx.k || fx_old.k);
+        wd_prev_us = t;
+        if (!gm) wd_acc_us = 0;
+        else if (wd_kick) {
+            if ((unsigned long)(wd_acc_us / 1000) > d_kgap) d_kgap = (unsigned long)(wd_acc_us / 1000);
+            wd_acc_us = 0; wd_kick = 0;
+        }
+        else if (sounding) {
+            wd_acc_us += dt;
+            if (!ext_n && wd_acc_us > (long long)(wd_t > PCM_WD_MIN ? wd_t : PCM_WD_MIN) * 100000LL) {
+                wd_note((long)(wd_acc_us / 1000));
+                wd_acc_us = 0;
+                music_off();
+                game(0);
+                wd_dead = 1;
+                wd_fired++;
+            }
         }
     }
     stage_tick();
