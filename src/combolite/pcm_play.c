@@ -22,7 +22,12 @@ static int       vol = 16, fx_vol = 16;
 
 static pcm_src_t src;
 static int       src_on;                /* источник открыт и не кончился */
-static int16_t   inb[INBUF];
+/* inb и mir -- из кучи и только пока проигрыватель занят (играет или режим
+ * игры; bufs_get / bufs_put): на rev4 (без PSRAM) 12,6 КБ внутренней памяти
+ * в простое нужны Wi-Fi и веб-серверу (14.11.2026: плата падала без памяти).
+ * Прежде: из кучи при pcm_init, не статикой: на rev4 (без PSRAM) 12 КБ
+ * внутренней памяти занимали бы и там, где проигрывателя нет (fw/pcm4.c) */
+static int16_t  *inb;
 static int       in_n, in_i;            /* кадров в inb, следующий кадр */
 static uint32_t  frac, step;            /* позиция между кадрами a и b, 16.16 */
 static int       a_l, a_r, b_l, b_r;
@@ -33,7 +38,11 @@ static unsigned long under;             /* недоборов */
 static int       starved;               /* ПЛИС стоит на границе (считан один раз) */
 
 /* Ячейки, которые игра загрузила сама (длинные команды, pcm_play.h). */
-static struct { uint8_t *d; long len, cap, size; } slot[PCM_SLOTS];
+/* d -- в куче, f -- ячейка-файл, xm -- в статике платы (xoff, xcap; x0 -- её
+ * первый байт: на стыке повтора эффекта нужен вместе с последним) */
+static struct { uint8_t *d; long len, cap, size; FILE *f; int xm; long xoff, xcap; uint8_t x0; long old; } slot[PCM_SLOTS];
+static int slot_has(int k) { return slot[k].d || slot[k].xm; }
+static void stage_drop(int k);
 static int       playing_slot;          /* чья память под источником, 0 -- ничья */
 static int       seq;                   /* разряд PCM_ST_SEQ */
 static int       ext_n;                 /* байт адреса блока ещё ждём (длинная команда) */
@@ -71,12 +80,16 @@ static int       wd_t = WD_DEFAULT, wd_dead;
 static int       wd_kick;               /* пинок пришёл, отметку ещё не взяли */
 static long long wd_last;
 static unsigned long wd_fired;
-static uint8_t   mir[MIR][PCM_BLK];
+static uint8_t (*mir)[PCM_BLK];
 static long      mir_abs[MIR];
 
 void pcm_init(const pcm_ops_t *o)
 {
     int k;
+    /* открытый источник -- закрыть (стенд зовёт pcm_init много раз; MP3 на
+     * rev4 -- одно состояние на всех, PCM_MP3_STATIC) */
+    if (src_on && src.close) src.close(&src);
+    src_on = 0;
     ops = *o;
     st = S_IDLE; run = 0; err = 0; ready = 1; wblk = 0; wabs = 0; rp = 0;
     src_on = 0; done = 1; last_l = last_r = LOW;
@@ -85,6 +98,25 @@ void pcm_init(const pcm_ops_t *o)
     wd_t = WD_DEFAULT; wd_dead = 0; wd_kick = 0; wd_last = 0; wd_fired = 0;
     under = 0; starved = 0;
     for (k = 0; k < MIR; k++) mir_abs[k] = -1;
+}
+
+/* Буферы источника и музыки режима игры: 0 -- есть. */
+static int bufs_get(void)
+{
+    int k;
+    if (inb && mir) return 0;
+    if (!inb) inb = malloc(INBUF * sizeof *inb);
+    if (!mir) {
+        mir = malloc(MIR * sizeof *mir);
+        for (k = 0; k < MIR; k++) mir_abs[k] = -1;
+    }
+    return inb && mir ? 0 : -1;
+}
+
+static void bufs_put(void)
+{
+    free(inb); inb = 0;
+    free(mir); mir = 0;
 }
 
 /* кадр выхода, который ПЛИС играет сейчас (с точностью до блока) */
@@ -98,7 +130,7 @@ static long long play_frame(void)
 static long long fx_end(const voice_t *v)
 {
     long long n;
-    if (!v->k || !slot[v->k].d || !v->step) return v->start;
+    if (!v->k || !slot_has(v->k) || !v->step) return v->start;
     n = ((long long)slot[v->k].len * v->reps << 16) / v->step;
     if (v->cut >= 0 && v->cut + FX_EDGE < v->start + n) return v->cut + FX_EDGE;
     return v->start + n;
@@ -115,6 +147,13 @@ uint8_t pcm_state(void)
 
 unsigned long pcm_underruns(void) { return under; }
 unsigned long pcm_watchdog_fired(void) { return wd_fired; }
+static unsigned long xc_miss, rp_bad;
+unsigned long pcm_xmem_misses(void) { return xc_miss; }
+unsigned long pcm_rp_bad(void) { return rp_bad; }
+void pcm_debug(int *rp_, int *wblk_, int *st_, int *gm_, int *src_)
+{
+    *rp_ = rp; *wblk_ = wblk; *st_ = st; *gm_ = gm; *src_ = src_on;
+}
 
 void pcm_volume(int v) { vol = v < 0 ? 0 : v > 16 ? 16 : v; }
 
@@ -239,21 +278,62 @@ static int make_block(uint8_t *blk)
 
 /* ---------------------------------------------------------- эффект */
 /* Отсчёт голоса на кадре f (от запуска плеера), 16 бит; 0 -- молчит. */
+/* Окна ячеек в статике: 2 блока с блока, где лежит j, -- j + 1 тоже в окне.
+ * Два окна: голосов два (fx, fx_old), замещается то, что брали раньше. */
+static struct { int k; long base; uint8_t d[2 * PCM_BLK]; } xc[2];
+static int xc_last;
+
+static void xc_drop(int k)
+{
+    if (xc[0].k == k) xc[0].k = 0;
+    if (xc[1].k == k) xc[1].k = 0;
+}
+
+/* Отсчёт j ячейки k (8 бит со знаком) */
+static int sample(int k, long j)
+{
+    long base;
+    int e, n;
+    if (slot[k].d) return ((const int8_t *)slot[k].d)[j];
+    if (!j) return (int8_t)slot[k].x0;
+    base = j & ~(long)(PCM_BLK - 1);
+    for (e = 0; e < 2; e++)
+        if (xc[e].k == k && xc[e].base == base) { xc_last = e; return (int8_t)xc[e].d[j - base]; }
+    /* окно на блок вперёд: его второй блок -- новый первый, дочитать один */
+    for (e = 0; e < 2; e++)
+        if (xc[e].k == k && xc[e].base + PCM_BLK == base) {
+            memmove(xc[e].d, xc[e].d + PCM_BLK, PCM_BLK);
+            xc_miss++;
+            if (slot[k].xcap - base >= 2 * PCM_BLK
+                && ops.xmem_read(ops.ctx, slot[k].xoff + base + PCM_BLK, xc[e].d + PCM_BLK, PCM_BLK) < 0) {
+                xc[e].k = 0;
+                return 0;
+            }
+            xc[e].base = base; xc_last = e;
+            return (int8_t)xc[e].d[j - base];
+        }
+    e = 1 - xc_last;
+    n = slot[k].xcap - base >= 2 * PCM_BLK ? 2 * PCM_BLK : PCM_BLK;
+    xc_miss++;
+    if (ops.xmem_read(ops.ctx, slot[k].xoff + base, xc[e].d, n) < 0) { xc[e].k = 0; return 0; }
+    xc[e].k = k; xc[e].base = base; xc_last = e;
+    return (int8_t)xc[e].d[j - base];
+}
+
 static int fx_at(const voice_t *v, long long f)
 {
-    const int8_t *d;
     long len, total, i, j;
     long long p, rel = f - v->start, end;
     int s0, s1, x, edge;
-    if (!v->k || rel < 0 || !(d = (const int8_t *)slot[v->k].d) || !(len = slot[v->k].len))
+    if (!v->k || rel < 0 || !slot_has(v->k) || !(len = slot[v->k].len))
         return 0;
     total = len * v->reps;
     p = rel * v->step;
     i = (long)(p >> 16);
     if (i >= total) return 0;
     j = i % len;
-    s0 = d[j];
-    s1 = i + 1 < total ? d[(j + 1) % len] : 0;
+    s0 = sample(v->k, j);
+    s1 = i + 1 < total ? sample(v->k, (j + 1) % len) : 0;
     x = (s0 << 8) + (int)(((long long)(s1 - s0) * (p & 0xFFFF)) >> 8);
     /* края -- плавные: сэмпл может начинаться и кончаться не с нуля */
     end = (((long long)total << 16) - p) / v->step;         /* кадров до конца */
@@ -336,7 +416,7 @@ static void fx_switch(int k, int reps, unsigned rate)
 static void fx_play(int n)
 {
     int k;
-    if (n < 1 || n > fx_n || !(k = fx_tab[n - 1].k) || !slot[k].len) { err = 1; return; }
+    if (n < 1 || n > fx_n || !(k = fx_tab[n - 1].k) || !slot[k].len || !slot_has(k)) { err = 1; return; }
     err = 0;
     fx_switch(k, fx_tab[n - 1].reps, fx_tab[n - 1].rate);
 }
@@ -348,12 +428,32 @@ static void fx_kill_slot(int k)
 }
 
 /* --------------------------------------------------------------- кольцо */
+/* PCM_GAME_STARVE (rev4, CMakeLists.txt): в режиме игры без музыки и
+ * эффекта тишину в кольцо не писать. ПЛИС на границе держит последний отсчёт
+ * -- середину шкалы, -- а запись блока в статику rev4 под нагрузкой шины стоит
+ * до 9 мс: 172 блока тишины в секунду отнимали у загрузки Gobliiins почти всё
+ * время ESP (14.11.2026). Перед остановкой -- два блока тишины, чтобы на выходе
+ * точно стояла середина. Сторож при этом стоит (выход не движется). */
+#ifdef PCM_GAME_STARVE
+static int quiet;                       /* блоков тишины подряд в режиме игры */
+static int fx_live(const voice_t *v, long long f0)
+{
+    return v->k && fx_end(v) > f0 && v->start < f0 + FRAMES;
+}
+#endif
+
 static void fill(int max)
 {
     static uint8_t blk[PCM_BLK];
     int n = 0, ahead = gm ? PCM_GAME_AHEAD : PCM_AHEAD;
     while (n < max && ((wblk - rp) & (PCM_NBLK - 1)) < ahead) {
         int m = (int)(wabs % MIR);
+#ifdef PCM_GAME_STARVE
+        long long f0 = (long long)wabs * FRAMES;
+        int idle = gm && !src_on && !ramp_in && !ramp_out && !fx_live(&fx, f0) && !fx_live(&fx_old, f0);
+        if (idle && quiet >= 2) break;
+        quiet = idle ? quiet + 1 : 0;
+#endif
         if (!make_block(blk)) break;
         memcpy(mir[m], blk, PCM_BLK); mir_abs[m] = wabs;
         fx_mix(wabs, blk);
@@ -431,7 +531,7 @@ void pcm_command(int cmd)
 /* Пустить открытый источник (rc -- как открылся). */
 static void start(int rc, int lp)
 {
-    if (rc != 0 || src.rate <= 0 || (src.ch != 1 && src.ch != 2)) {
+    if (rc != 0 || src.rate <= 0 || (src.ch != 1 && src.ch != 2) || bufs_get() < 0) {
         if (src.close) src.close(&src);
         if (st != S_IDLE && !gm) stop_music();
         err = 1;
@@ -506,17 +606,167 @@ static void slot_free(int k)
     if (playing_slot == k) music_off();             /* его память под источником */
     fx_kill_slot(k);
     free(slot[k].d);
-    slot[k].d = 0; slot[k].len = slot[k].cap = slot[k].size = 0;
+    stage_drop(k);
+    if (slot[k].f) fclose(slot[k].f);
+    xc_drop(k);
+    slot[k].d = 0; slot[k].f = 0; slot[k].len = slot[k].cap = slot[k].size = 0;
+    slot[k].xm = 0; slot[k].xoff = slot[k].xcap = 0; slot[k].old = 0;
 }
 
-/* Начать ячейку; size > 0 -- память сразу на всю длину. */
+/* Место в статике на size байт: первый промежуток между ячейками, по блокам;
+ * -1 -- нет. */
+static long xmem_find(long size)
+{
+    long need = (size + PCM_BLK - 1) & ~(long)(PCM_BLK - 1), at = 0;
+    int k, moved;
+    do {
+        moved = 0;
+        for (k = 1; k < PCM_SLOTS; k++)
+            if (slot[k].xm && at < slot[k].xoff + slot[k].xcap && slot[k].xoff < at + need) {
+                at = slot[k].xoff + slot[k].xcap;
+                moved = 1;
+            }
+    } while (moved);
+    return at + need <= ops.xmem_size ? at : -1;
+}
+
+/* Дописать в ячейку в статике. Статика пишется блоками: неполный блок --
+ * прочитать, дополнить, записать (хвост блока за длиной -- мусор, он свой). */
+static int xmem_append(int k, uint16_t a, uint16_t n)
+{
+    static uint8_t blk[PCM_BLK];
+    if (slot[k].len + n > slot[k].xcap) return -1;
+    xc_drop(k);
+    while (n) {
+        long at = slot[k].len, base = at & ~(long)(PCM_BLK - 1);
+        int o = (int)(at - base), m = PCM_BLK - o;
+        if (m > n) m = n;
+        if (o && ops.xmem_read(ops.ctx, slot[k].xoff + base, blk, PCM_BLK) < 0) return -1;
+        if (ops.mem_read(ops.ctx, a, blk + o, m) < 0) return -1;
+        if (ops.xmem_write(ops.ctx, slot[k].xoff + base, blk, PCM_BLK) < 0) return -1;
+        if (!at) slot[k].x0 = blk[0];
+        slot[k].len += m; a = (uint16_t)(a + m); n = (uint16_t)(n - m);
+    }
+    return 0;
+}
+
+/* Начать ячейку; size > 0 -- память сразу на всю длину (или файл). */
 static int slot_begin(int k, long size)
 {
     slot_free(k);
     if (!size) return 0;
+    if (ops.slot_file && size >= PCM_FILE_MIN) {
+        if (!(slot[k].f = ops.slot_file(ops.ctx, k, size, &slot[k].old))) return -1;
+        slot[k].size = size;
+        return 0;
+    }
+    if (ops.xmem_size && size < PCM_FILE_MIN) {
+        long off = xmem_find(size);
+        if (off < 0) return -1;
+        slot[k].xm = 1; slot[k].xoff = off;
+        slot[k].xcap = (size + PCM_BLK - 1) & ~(long)(PCM_BLK - 1);
+        slot[k].size = size;
+        return 0;
+    }
     if (slots_total() + size > PCM_MEM_MAX) return -1;
     if (!(slot[k].d = malloc((size_t)size))) return -1;
     slot[k].cap = slot[k].size = size;
+    return 0;
+}
+
+/* Дописать в ячейку-файл. Длина растёт по кускам: источник, который её
+ * играет, видит только записанное. */
+/* Дописывание копится в fst и уходит в файл кусками до границы FSTAGE
+ * (14.11.2026): по 512 байт вразнобой карта rev4 на каждый кусок читала и
+ * писала сектор, а под такими мелкими записями уходила в уборку дольше 5 с.
+ * Целые 4 КБ по границе -- одна запись восьми секторов. slot[k].len -- только
+ * то, что уже в файле: источник видит записанное. Остаток уходит, когда
+ * ячейка дописана до длины 0Ah, перед её пуском, перед дописыванием другой
+ * ячейки и после паузы (stage_tick). fst -- из кучи, пока есть что писать. */
+#define FSTAGE 4096
+static uint8_t *fst;
+static int      fst_k, fst_n, fst_idle;
+
+static unsigned long st_same, st_wrote;  /* байт: совпало со старым файлом, записано */
+
+/* Кусок уже лежит в старом файле (slot_file, *old)? Сверка по 512 байт. */
+static int stage_same(int k, int n)
+{
+    static uint8_t cmp[PCM_BLK];
+    int at = 0;
+    if (slot[k].len + n > slot[k].old || fseek(slot[k].f, slot[k].len, SEEK_SET) != 0) return 0;
+    while (at < n) {
+        int m = n - at > PCM_BLK ? PCM_BLK : n - at;
+        if (fread(cmp, 1, (size_t)m, slot[k].f) != (size_t)m || memcmp(cmp, fst + at, (size_t)m)) return 0;
+        at += m;
+    }
+    return 1;
+}
+
+static int stage_flush(void)
+{
+    int k = fst_k, n = fst_n;
+    fst_n = 0;
+    if (!n) return 0;
+    if (!slot[k].f) return -1;
+    if (stage_same(k, n)) st_same += (unsigned long)n;
+    else {
+        if (fseek(slot[k].f, slot[k].len, SEEK_SET) != 0
+            || fwrite(fst, 1, (size_t)n, slot[k].f) != (size_t)n || fflush(slot[k].f) != 0)
+            return -1;
+        st_wrote += (unsigned long)n;
+    }
+    slot[k].len += n;
+    return 0;
+}
+
+void pcm_file_stats(unsigned long *same, unsigned long *wrote) { *same = st_same; *wrote = st_wrote; }
+
+static void stage_drop(int k)
+{
+    if (fst_n && fst_k == k) fst_n = 0;
+}
+
+/* Шаг проигрывателя: дописывания нет -- остаток в файл, буфер в кучу. */
+static void stage_tick(void)
+{
+    if (!fst || ++fst_idle < 20) return;
+    if (fst_n && stage_flush() < 0) err = 1;
+    free(fst); fst = 0;
+}
+
+static int file_append(int k, uint16_t a, uint16_t n)
+{
+    if (fst_n && fst_k != k && stage_flush() < 0) return -1;
+    if (!fst && !(fst = malloc(FSTAGE))) return -1;
+    fst_k = k; fst_idle = 0;
+    while (n) {
+        int target = FSTAGE - (int)(slot[k].len % FSTAGE);   /* до границы */
+        int m = target - fst_n;
+        if (m > n) m = n;
+        if (ops.mem_read(ops.ctx, a, fst + fst_n, m) < 0) return -1;
+        fst_n += m; a = (uint16_t)(a + m); n = (uint16_t)(n - m);
+        if (fst_n == target && stage_flush() < 0) return -1;
+    }
+    if (slot[k].size && slot[k].len + fst_n >= slot[k].size && stage_flush() < 0) return -1;
+    return 0;
+}
+
+/* Ячейка 01h доросла до PCM_FILE_MIN -- в файл. Играющую останавливаем:
+ * источник читает её память, а её больше нет. */
+static int slot_to_file(int k)
+{
+    long old;
+    FILE *f = ops.slot_file(ops.ctx, k, 0, &old);
+    if (!f) return -1;
+    if (slot[k].len && (fwrite(slot[k].d, 1, (size_t)slot[k].len, f) != (size_t)slot[k].len || fflush(f) != 0)) {
+        fclose(f);
+        return -1;
+    }
+    if (playing_slot == k) music_off();
+    fx_kill_slot(k);
+    free(slot[k].d);
+    slot[k].d = 0; slot[k].cap = 0; slot[k].f = f;
     return 0;
 }
 
@@ -524,6 +774,9 @@ static int slot_append(int k, uint16_t a, uint16_t n)
 {
     long need = slot[k].len + n;
     if ((long)a + n > 0x10000L) return -1;
+    if (!slot[k].f && !slot[k].xm && ops.slot_file && need >= PCM_FILE_MIN && slot_to_file(k) < 0) return -1;
+    if (slot[k].f) return file_append(k, a, n);
+    if (slot[k].xm) return xmem_append(k, a, n);
     if (need > slot[k].cap) {
         long cap = slot[k].cap ? slot[k].cap : 4096;
         uint8_t *d;
@@ -583,10 +836,13 @@ static void ext_command(void)
             ok = k >= 1 && k < PCM_SLOTS && slot_append(k, (uint16_t)le16(b + 2), (uint16_t)le16(b + 4)) == 0;
             break;
         case PCM_OP_PLAY:
-            if (k >= 1 && k < PCM_SLOTS && slot[k].len > 0) {
+            if (fst_n && fst_k == k && stage_flush() < 0) break;
+            if (k >= 1 && k < PCM_SLOTS && slot[k].len > 0 && !slot[k].xm) {  /* в статике -- только эффект */
                 src_close();
                 memset(&src, 0, sizeof src);
-                start(ops.open_mem(ops.ctx, &slot[k].d, &slot[k].len, slot[k].size, &src), b[2] & 1);
+                start(!slot[k].f ? ops.open_mem(ops.ctx, &slot[k].d, &slot[k].len, slot[k].size, &src)
+                      : ops.open_file ? ops.open_file(ops.ctx, slot[k].f, &slot[k].len, slot[k].size, &src)
+                      : -1, b[2] & 1);
                 if (src_on) playing_slot = k;
                 ok = !err;
             }
@@ -602,7 +858,7 @@ static void ext_command(void)
             ok = fx_table(k, (uint16_t)le16(b + 2)) == 0;
             break;
         case PCM_OP_GAME:
-            if (k <= 1) { game(k); wd_dead = 0; ok = 1; }
+            if (k <= 1 && (!k || bufs_get() == 0)) { game(k); wd_dead = 0; ok = 1; }
             break;
         case PCM_OP_STOP:
             if (k & 1) music_off();
@@ -620,13 +876,46 @@ static void ext_command(void)
     }
     err = !ok;
     seq ^= 1;                                       /* команда исполнена */
+    if (gm) wd_kick = 1;    /* игра ждала ответа -- жива (rev4: ответ бывает и через секунды) */
+}
+
+/* Отладка (pcm4.c, /api/pcm?slotplay=1): готовый файл f длиной len --
+ * ячейка-файл k, и сразу пуск, как 03h k 0. */
+void pcm_debug_slot_play(int k, FILE *f, long len)
+{
+    if (k < 1 || k >= PCM_SLOTS || !f) return;
+    slot_free(k);
+    slot[k].f = f; slot[k].len = slot[k].size = slot[k].old = len;
+    src_close();
+    memset(&src, 0, sizeof src);
+    start(ops.open_file ? ops.open_file(ops.ctx, f, &slot[k].len, slot[k].size, &src) : -1, 0);
+    if (src_on) playing_slot = k;
+}
+
+/* Признак жизни «Вектора» со стороны (rev4: команда винта, pcm4.c). */
+void pcm_kick(void)
+{
+    if (gm) wd_kick = 1;
 }
 
 int pcm_tick(int max)
 {
     int mail = -1;
-    uint8_t ctl = (uint8_t)((pcm_state() & 0xFE) | (run ? 0x01 : 0));
-    if (ops.xchg(ops.ctx, ctl, (uint16_t)wblk, &rp, &mail) < 0) return -1;
+    uint8_t ctl;
+    ctl = (uint8_t)((pcm_state() & 0xFE) | (run ? 0x01 : 0));
+    {
+        /* ПЛИС не уходит вперёд записанного (граница -- wblk): указатель
+         * дальше PCM_AHEAD блоков впереди -- испорчен обменом. Один такой
+         * сдвигал отсчёт сторожа на ~3 с (подозрение, плата №1 14.11.2026):
+         * отбросить и сосчитать. */
+        uint16_t nrp;
+        if (ops.xchg(ops.ctx, ctl, (uint16_t)wblk, &nrp, &mail) < 0) return -1;
+        /* только в режиме игры: вне его стоп (stop_music) отводит wblk назад,
+         * к rp + 1, и ПЛИС честно оказывается впереди (PCMTEST на плате №1:
+         * указатель отбрасывался на каждом обмене, кольцо не доливалось) */
+        if (gm && ((wblk - nrp) & (PCM_NBLK - 1)) > PCM_AHEAD && st != S_START) rp_bad++;
+        else rp = nrp;
+    }
     if (st == S_START && !run) {
         /* ПЛИС только что получила run = 0 -- указатель в начале */
         rp = 0; wblk = 0;
@@ -635,7 +924,11 @@ int pcm_tick(int max)
         run = 1;
     }
     else if (st == S_PLAY) {
+#ifdef PCM_GAME_STARVE
+        if (rp == wblk && !starved && quiet < 2) { under++; starved = 1; }
+#else
         if (rp == wblk && !starved) { under++; starved = 1; }
+#endif
         fill(max);
         if (rp != wblk) starved = 0;
     }
@@ -645,14 +938,19 @@ int pcm_tick(int max)
      * play_frame -- мусор. Пинок до того -- отметка с первого шага выхода. */
     if (gm && (st == S_PLAY || st == S_DRAIN)) {
         long long now = play_frame();
+        /* пинок -- и почта, и исполненная длинная команда (игра ждала её
+         * ответа), и команда винта (pcm_kick из pcm4.c): на медленной записи
+         * карты rev4 сторож гасил музыку интро Gobliiins (14.11.2026) */
         if (wd_kick || now < wd_last) { wd_last = now; wd_kick = 0; }
-        else if (!ext_n && now - wd_last > (long long)wd_t * PCM_RATE / 10) {
+        else if (!ext_n && now - wd_last > (long long)(wd_t > PCM_WD_MIN ? wd_t : PCM_WD_MIN) * PCM_RATE / 10) {
             music_off();
             game(0);
             wd_dead = 1;
             wd_fired++;
         }
     }
+    stage_tick();
+    if (st == S_IDLE && !gm && !src_on && (inb || mir)) bufs_put();   /* простой -- память отдать */
     if (hurry) { hurry--; return 2; }
     if (gm) return 2;
     return st != S_IDLE;

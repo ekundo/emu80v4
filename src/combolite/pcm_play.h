@@ -91,6 +91,7 @@
 #define COMBO_PCM_PLAY_H
 
 #include <stdint.h>
+#include <stdio.h>
 
 #define PCM_RATE      44092             /* 50 МГц / 1134 (hdl/pcm.v, DIV) */
 #define PCM_BLK       512               /* байт в блоке кольца */
@@ -117,7 +118,24 @@
 
 #define PCM_SLOTS     64                /* ячейки 1..63 */
 #define PCM_FX_MAX    127               /* эффектов в таблице */
+#ifndef PCM_MEM_MAX                     /* rev4 без PSRAM задаёт меньше (CMakeLists.txt) */
 #define PCM_MEM_MAX   (1024L * 1024)    /* все ячейки вместе, байт (PSRAM) */
+#endif
+/* ЯЧЕЙКИ-ФАЙЛЫ (14.11.2026, rev4 без PSRAM: fw/pcm4.c). Если обвязка дала
+ * slot_file, ячейка от PCM_FILE_MIN байт живёт не в памяти, а в файле на
+ * карте: 0Ah с такой длиной сразу заводит файл, а ячейка 01h переезжает в
+ * файл, когда дорастает до PCM_FILE_MIN. В PCM_MEM_MAX файлы не считаются.
+ * Музыку (WAV, MP3) ячейка-файл играет, и пока её дописывают тоже; эффектом
+ * она быть не может (голос эффекта читает ячейку по кадрам, вразброс), MOD
+ * из неё не играет. Протокол для «Вектора» тот же. */
+#ifndef PCM_FILE_MIN
+#define PCM_FILE_MIN  (16L * 1024)
+#endif
+/* ЯЧЕЙКИ В СТАТИКЕ (14.11.2026, rev4: страница 3 DD6B, 64 КБ). Если обвязка
+ * дала xmem_size, ячейка 0Ah меньше PCM_FILE_MIN ложится не в кучу, а в
+ * статику платы: это эффекты режима игры. Голос эффекта читает её окнами по
+ * 2 блока (PCM_BLK), на два голоса -- два окна. Музыкой такая ячейка не
+ * играет (ошибка): музыка от 16 КБ -- ячейки-файлы. 01h -- по-прежнему куча. */
 enum { PCM_OP_BEGIN = 1, PCM_OP_APPEND, PCM_OP_PLAY, PCM_OP_VOLUME, PCM_OP_FREE,
        PCM_OP_FX_TABLE, PCM_OP_GAME, PCM_OP_STOP, PCM_OP_FX_VOLUME, PCM_OP_BEGIN_SIZE,
        PCM_OP_WATCHDOG };
@@ -149,6 +167,20 @@ typedef struct {
     /* n байт ОЗУ «Вектора» с адреса a (зеркало в статике); 0 -- прочитано */
     int (*mem_read)(void *ctx, uint16_t a, uint8_t *dst, int n);
     void *ctx;
+    /* Ячейки-файлы (см. PCM_FILE_MIN); 0 -- все ячейки в памяти.
+     * slot_file: файл ячейки k на чтение и запись; 0 -- нет. size -- длина
+     * из 0Ah (0 -- неизвестна): файл с той же ячейкой и длиной, оставшийся
+     * с прошлого раза, можно отдать как есть, и *old -- сколько в нём байт
+     * (иначе 0, файл пустой). Дописывание сверяет их и пишет только
+     * несовпавшее: карта rev4 под записью уходит в занятость на секунды.
+     * open_file: источник из ячейки-файла, как open_mem; f -- от slot_file. */
+    FILE *(*slot_file)(void *ctx, int k, long size, long *old);
+    int (*open_file)(void *ctx, FILE *f, const long *have, long size, pcm_src_t *src);
+    /* Ячейки в статике; xmem_size = 0 -- нет. off и n -- кратны PCM_BLK,
+     * off + n <= xmem_size; 0 -- удалось. */
+    int (*xmem_read)(void *ctx, long off, uint8_t *dst, int n);
+    int (*xmem_write)(void *ctx, long off, const uint8_t *src, int n);
+    long xmem_size;
 } pcm_ops_t;
 
 void pcm_init(const pcm_ops_t *ops);
@@ -163,7 +195,27 @@ void pcm_volume(int v);                 /* 0..16, 16 -- как в файле */
 uint8_t pcm_state(void);                /* PCM_ST_* */
 /* Недоборов с запуска: ПЛИС дошла до границы, пока звук шёл (ESP не успела). */
 unsigned long pcm_underruns(void);
+/* Внешний признак жизни «Вектора» для сторожа режима игры (rev4: команды
+ * винта -- игра грузится, а не висит). */
+void pcm_kick(void);
+/* Отладка: готовый файл -- ячейка-файл k, и пуск. */
+void pcm_debug_slot_play(int k, FILE *f, long len);
+/* Сколько обменов дали указатель ПЛИС впереди записанного (отброшены). */
+unsigned long pcm_rp_bad(void);
+/* Наименьший срок сторожа, десятые секунды: 0Bh меньше не ставит. rev4 --
+ * 30 (CMakeLists.txt): на плате №1 сторож гасил музыку посреди уровня при
+ * сроке игры 1 с (14.11.2026), причина не найдена. */
+#ifndef PCM_WD_MIN
+#define PCM_WD_MIN 0
+#endif
 /* Сколько раз сработал сторож режима игры. */
 unsigned long pcm_watchdog_fired(void);
+/* Сколько раз голос эффекта читал окно ячейки из статики (xmem_read). */
+unsigned long pcm_xmem_misses(void);
+/* Для журнала: блок ПЛИС, следующий блок ESP, состояние (0 -- молчит, 1 --
+ * пуск, 2 -- играет, 3 -- доигрывает), режим игры, источник открыт. */
+void pcm_debug(int *rp_, int *wblk_, int *st_, int *gm_, int *src_);
+/* Ячейки-файлы с запуска: байт совпало со старым файлом и записано. */
+void pcm_file_stats(unsigned long *same, unsigned long *wrote);
 
 #endif

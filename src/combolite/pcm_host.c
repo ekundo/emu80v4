@@ -103,7 +103,7 @@ static int x_mem_read(void *c, uint16_t a, uint8_t *dst, int n)
 
 void pcm_host_init(const char *music_dir, pcm_host_mem_fn m, void *c)
 {
-    static const pcm_ops_t ops = { x_xchg, x_ring, x_open, x_open_mem, x_mem_read, 0 };
+    static const pcm_ops_t ops = { x_xchg, x_ring, x_open, x_open_mem, x_mem_read, 0, 0, 0, 0, 0, 0 };   /* ячейки -- в памяти */
     snprintf(music, sizeof music, "%s", music_dir ? music_dir : "");
     mem_fn = m; mem_ctx = c;
     on = 1;

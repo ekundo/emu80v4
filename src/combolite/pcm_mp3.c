@@ -25,7 +25,10 @@
 #pragma GCC diagnostic pop
 #endif
 
-#define CHUNK 16384
+#ifndef PCM_MP3_CHUNK                   /* rev4 без PSRAM берёт меньше (CMakeLists.txt) */
+#define PCM_MP3_CHUNK 16384
+#endif
+#define CHUNK PCM_MP3_CHUNK
 #define LIVE_MIN 4096                   /* дописываемая ячейка: меньше -- ждать */
 #define DEC_DELAY 529                   /* задержка minimp3 сверх кодера (замер 13.11.2026) */
 
@@ -41,6 +44,25 @@ typedef struct {
     long      skip, done;               /* осталось пропустить; выдано */
     int16_t   pcm[MINIMP3_MAX_SAMPLES_PER_FRAME];   /* кадр, как его дал декодер */
 } mp3_t;
+
+/* PCM_MP3_STATIC (rev4 без PSRAM, CMakeLists.txt): одно состояние статикой --
+ * ~14 КБ одним куском в дроблёной куче могло не найтись. Источник у
+ * проигрывателя один: прежний закрывается до открытия нового (pcm_play.c). */
+#ifdef PCM_MP3_STATIC
+static mp3_t mp3_one;
+static int   mp3_used;
+static mp3_t *mp3_new(void)
+{
+    if (mp3_used) return 0;
+    mp3_used = 1;
+    memset(&mp3_one, 0, sizeof mp3_one);
+    return &mp3_one;
+}
+static void mp3_del(mp3_t *m) { if (m == &mp3_one) mp3_used = 0; }
+#else
+static mp3_t *mp3_new(void) { return calloc(1, sizeof(mp3_t)); }
+static void mp3_del(mp3_t *m) { free(m); }
+#endif
 
 static void refill(mp3_t *m)
 {
@@ -123,8 +145,8 @@ static void mp3_close(pcm_src_t *s)
 {
     mp3_t *m = s->st;
     if (!m) return;
-    if (m->io.f) fclose(m->io.f);
-    free(m);
+    pcm_io_close(&m->io);
+    mp3_del(m);
     s->st = 0;
 }
 
@@ -162,7 +184,7 @@ int pcm_mp3_open(const pcm_io_t *io, pcm_src_t *s)
     mp3dec_frame_info_t info;
     uint8_t h[10];
     int n;
-    mp3_t *m = calloc(1, sizeof *m);
+    mp3_t *m = mp3_new();
     if (!m) return -1;
     m->io = *io;
     pcm_io_seek(&m->io, 0);
@@ -182,6 +204,6 @@ int pcm_mp3_open(const pcm_io_t *io, pcm_src_t *s)
     mp3_rewind(s);
     return 0;
 fail:
-    free(m); s->st = 0;
+    mp3_del(m); s->st = 0;
     return -1;
 }
