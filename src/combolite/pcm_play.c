@@ -1101,7 +1101,13 @@ int pcm_tick(int max)
         long long t = wd_clock_us();
         long long dt = wd_prev_us ? t - wd_prev_us : 0;
         if (dt < 0 || dt > 50000) dt = dt < 0 ? 0 : 50000;   /* модель: позиция выхода прыгает */
-        int sounding = (st == S_PLAY || st == S_DRAIN) && (src_on || ramp_out || fx.k || fx_old.k);
+        /* эффект звучит, пока не кончился по времени: номер ячейки (fx.k,
+         * fx_old.k) остаётся и после конца -- по нему сторож считал и в
+         * тишине (проверочный набор Gobliiins на плате №1: 08h, пинки,
+         * загрузка без пинков -- срабатывание через 0,5 с) */
+        long long pf = play_frame();
+        int sounding = (st == S_PLAY || st == S_DRAIN)
+                    && (src_on || ramp_out || (fx.k && fx_end(&fx) > pf) || (fx_old.k && fx_end(&fx_old) > pf));
         wd_prev_us = t;
         if (!gm) wd_acc_us = 0;
         else if (wd_kick) {
