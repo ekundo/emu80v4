@@ -25,10 +25,60 @@
 #include "Emulation.h"
 
 #include "Pal.h"
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+
 #include "SoundMixer.h"
 #include "Cpu.h"
 
 using namespace std;
+
+// Сумма -- в int16 через мягкий потолок, как загиб суммы на плате ComboLite: до
+// 0,75 шкалы линейно, выше наклон 1/4, у края срез. Прежде лишнее переполняло
+// int16 и перескакивало на другой край. Громкость 7 (сумма без знака) -- как была
+int SoundMixer::limit(int x)
+{
+    if (m_volume >= 7)
+        return x;
+    const int knee = 24575;
+    int a = x < 0 ? -x : x;
+    if (a > knee)
+        a = knee + (a - knee) / 4;
+    if (a > 32767)
+        a = 32767;
+    return x < 0 ? -a : a;
+}
+
+
+// EMU80_WAV=путь: отладочная запись выхода микшера (16 бит, стерео) и при
+// заглушенном звуке -- прогоны без окна стартуют заглушенными
+static FILE* s_wav = nullptr;
+static uint32_t s_wavN = 0;
+static void wavHeader()
+{
+    uint32_t rate = g_emulation->getSampleRate(), data = s_wavN * 4, riff = 36 + data, br = rate * 4;
+    uint8_t h[44] = {'R','I','F','F',0,0,0,0,'W','A','V','E','f','m','t',' ',16,0,0,0,1,0,2,0,
+                     0,0,0,0,0,0,0,0,4,0,16,0,'d','a','t','a',0,0,0,0};
+    memcpy(h + 4, &riff, 4); memcpy(h + 24, &rate, 4); memcpy(h + 28, &br, 4); memcpy(h + 40, &data, 4);
+    long pos = ftell(s_wav);
+    fseek(s_wav, 0, SEEK_SET); fwrite(h, 1, 44, s_wav); fseek(s_wav, pos < 44 ? 44 : pos, SEEK_SET);
+    fflush(s_wav);
+}
+static void wavDump(int l, int r)
+{
+    static int state = -1;
+    if (state < 0) {
+        const char* p = getenv("EMU80_WAV");
+        state = p && *p && (s_wav = fopen(p, "wb"));
+        if (state) wavHeader();
+    }
+    if (!state) return;
+    int16_t v[2] = {int16_t(l), int16_t(r)};
+    fwrite(v, 2, 2, s_wav);
+    if ((++s_wavN & 0x3fff) == 0) wavHeader();
+}
+
 
 // Вызывается 48000 (SAMPLE_RATE) раз в секунду для получения текущего сэмпла и его проигрывания
 void SoundMixer::operate()
@@ -36,13 +86,16 @@ void SoundMixer::operate()
     int leftSample = 0;
     int rightSample = 0;
     for(auto it = m_soundSources.begin(); it != m_soundSources.end(); it++) {
-        StereoSample sample = (*it)->getSample();
+        StereoSample sample = (*it)->getOutput();
         leftSample += m_volume < 7 ? sample.left : abs(sample.left - (*it)->getMinimumSampleValue());
         rightSample += m_volume < 7 ? sample.right : abs(sample.right - (*it)->getMinimumSampleValue());
     }
 
-    leftSample = m_muted ? m_silenceLevel : (leftSample >> m_sampleShift) + m_silenceLevel;
-    rightSample = m_muted ? m_silenceLevel : (rightSample >> m_sampleShift) + m_silenceLevel;
+    leftSample = limit(leftSample >> m_sampleShift) + m_silenceLevel;
+    rightSample = limit(rightSample >> m_sampleShift) + m_silenceLevel;
+    wavDump(leftSample, rightSample);
+    if (m_muted)
+        leftSample = rightSample = m_silenceLevel;
 
     palPlaySample(leftSample, rightSample);
 
@@ -141,6 +194,26 @@ void SoundSource::updateAmpFactor()
 }
 
 
+StereoSample SoundSource::getOutput()
+{
+    StereoSample s = getSample();
+    if (!m_dcBlock)
+        return s;
+    if (!m_dcPrimed) {
+        // исходный уровень -- первый отсчет: иначе удар на запуске
+        m_dcPrimed = true;
+        m_dcXL = s.left;
+        m_dcXR = s.right;
+    }
+    double a = 1.0 - 2 * 3.14159265 * 4 / g_emulation->getSampleRate();
+    m_dcYL = s.left - m_dcXL + a * m_dcYL;
+    m_dcXL = s.left;
+    m_dcYR = s.right - m_dcXR + a * m_dcYR;
+    m_dcXR = s.right;
+    return {int(m_dcYL), int(m_dcYR)};
+}
+
+
 StereoSample SoundSource::getSample()
 {
     int val = calcValue() * m_ampFactor / 100;
@@ -161,6 +234,11 @@ bool SoundSource::setProperty(const std::string& propertyName, const EmuValuesLi
     } else if (propertyName == "volume") {
         setVolume(values[0].asInt());
         return true;
+    } else if (propertyName == "dcBlock") {
+        if (values[0].asString() == "yes" || values[0].asString() == "no") {
+            setDcBlock(values[0].asString() == "yes");
+            return true;
+        }
     } else if (propertyName == "polarity") {
         if (values[0].asString() == "positive" || values[0].asString() == "negative") {
             setNegative(values[0].asString() == "negative");

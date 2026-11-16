@@ -54,6 +54,12 @@ class SoundSource : public EmuObject
         void setNegative(bool negative);
         void setMuted(bool muted);
 
+        // Отсчет для микшера: getSample(), с dcBlock -- через разделительный
+        // конденсатор (срез ~4 Гц): постоянная покоящегося источника не
+        // занимает запас суммы, как на выходе платы ComboLite
+        StereoSample getOutput();
+        void setDcBlock(bool on) {m_dcBlock = on;}
+
     protected:
         int m_ampFactor = 100;
         int m_volume = 100;
@@ -61,6 +67,9 @@ class SoundSource : public EmuObject
     private:
         bool m_muted = false;
         bool m_negative = false;
+        bool m_dcBlock = false;
+        bool m_dcPrimed = false;
+        double m_dcXL = 0, m_dcYL = 0, m_dcXR = 0, m_dcYR = 0;
 
         void updateAmpFactor();
 };
@@ -121,6 +130,10 @@ class SoundMixer : public ActiveDevice
 
         // возвращает текущий уровень громкости
         int getVolume();
+
+    private:
+        int limit(int x);
+    public:
 
     private:
         // Список источников звука
