@@ -54,7 +54,12 @@ void RenderHelper::setPaintWidget(PaintWidget* widget)
 
 void RenderHelper::onTimer()
 {
+    // On macOS Qt timers also fire while a native menu is open (menu tracking), and a manual
+    // processEvents() dequeues and dispatches the mouse events meant for the menu: a click on
+    // a menu item is often lost. The slot is called from the event loop anyway
+#ifndef Q_OS_MACOS
     getApplication()->processEvents();
+#endif
 
     if (!m_paused)
         emuEmulationCycle();
